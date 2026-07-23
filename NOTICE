@@ -1,0 +1,26 @@
+T-Deck Hybrid Phone firmware
+Combined work licensed under GPL-3.0-or-later (see COPYING).
+
+This firmware combines:
+
+- meshpunk (MIT) — https://github.com/PhilMo6/meshpunk (fork of
+  meshpunk/gui). LVGL/luavgl launcher + MeshCore integration for the
+  LilyGO T-Deck. Original license headers retained.
+- MeshCore (MIT) — https://github.com/meshcore-dev/MeshCore
+  (git submodule at lib/MeshCore).
+- pyxis (GPL-3.0) — https://github.com/torlando-tech/pyxis. Source of
+  the embedded Reticulum/LXMF/LXST core: lib/pyxis_core/ (reimplemented
+  service + vendored TCPClientInterface/HDLC), lib/auto_interface/,
+  lib/microreticulum-shim/, lib/libbz2/ (bzip2, BSD-style license, via
+  pyxis), and the patch_*.py build scripts. Per-file provenance is
+  cited in headers/comments.
+- microReticulum (MIT) — https://github.com/attermann/microReticulum
+  via the pinned fork https://github.com/torlando-tech/microReticulum.
+- microLXMF — https://github.com/torlando-tech/microLXMF (pinned).
+- microStore — https://github.com/attermann/microStore (pinned).
+- LVGL, luavgl, Lua, and the other vendored libraries under lib/ retain
+  their respective upstream licenses.
+
+MIT-licensed components are incorporated into the GPL-3.0 combined work
+under the one-way compatibility of the MIT license; their original
+copyright notices and license texts are preserved in place.

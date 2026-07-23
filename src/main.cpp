@@ -28,6 +28,10 @@
 #include "usb_manager.h"
 #include "usb_fs.h"
 #include "tdeck_link.h"
+#include "PyxisService.h"   // hybrid phone: embedded Reticulum/LXMF service
+#include "PyxisCall.h"      // hybrid phone: LXST voice engine (M3)
+#include "rns_bridge.h"     // hybrid phone: _rns_* Lua bindings + event dispatch
+#include "phone_bridge.h"   // hybrid phone: _phone_* Lua bindings + event dispatch
 
 // Meshcore
 #include "punkmesh.h"
@@ -258,7 +262,12 @@ static bool    dst_enabled = false;
 // Firmware-level preferences (unified in /firmware_prefs)
 static bool   use_sd_pref = true;
 static String clock_fmt_str = "12";
-static bool   ble_enabled_pref = true;
+// Hybrid phone: BLE companion defaults OFF. With the RNS service +
+// WiFi active, BLE drove internal RAM to ~8KB free / 4KB largest block
+// on-device (2026-07-22) and AutoInterface began dropping announces.
+// Users who want the companion can still enable it in Settings; the
+// saved preference (firmware_prefs) overrides this default either way.
+static bool   ble_enabled_pref = false;
 bool   ble_bond_clear_pref = false;
 static bool   wifi_enabled_pref = true;
 // Saved WiFi networks (multi-slot). /wifi_creds holds alternating ssid/pass
@@ -546,6 +555,13 @@ static bool     wa_was_connected = false; // successful connect since last failu
 static uint32_t wa_reconnect_at = 0;      // pending grace round after AP loss
 
 static void wifi_radio_park() {
+  // Hybrid phone (HYBRID_PLAN D6): while the Pyxis RNS service holds
+  // WiFi, never park the radio — the phone side needs the link up. The
+  // service re-kicks connect rounds itself when the AP is lost.
+  if (pyxis_wifi_hold()) {
+    SLog.println("[WIFI] park vetoed (RNS service holds WiFi)");
+    return;
+  }
   UsbFlashGuard _g;
   WiFi.disconnect(true);   // true = radio off too
   SLog.println("[WIFI] no known network reachable — radio parked");
@@ -6550,6 +6566,11 @@ void setupLuaVGL() {
   // Unified drive-aware _fs_* family (fs_bridge.cpp) — used by lib/fileman.lua
   fs_bridge_register(L);
 
+  // Hybrid phone: _rns_* family (rns_bridge.cpp) — used by lib/rns.lua
+  rns_bridge_register(L);
+  // Hybrid phone: _phone_* family (phone_bridge.cpp) — used by lib/phone.lua
+  phone_bridge_register(L);
+
   // USB-OTG host manager (_usb_*) — used by Tools/USB (also PHY boot self-heal)
   usb_manager_register_lua(L);
 
@@ -7912,6 +7933,89 @@ static void log_boot_mem(const char* stage) {
               lua_kb);
 }
 
+// ── Hybrid phone glue (HYBRID_PLAN D2/D6/D11) ──────────────────────────────
+// Host hooks the Pyxis service calls (declared in PyxisService.h), plus the
+// core-0 event drain — the rns_event_queue sibling of drain_rx_events().
+
+// Service-requested WiFi (re)connect round. wifi_auto_kick() touches WiFi
+// APIs and wa_* state that live on core 0, so the request marshals through
+// a flag drained in loop() rather than running on the service task.
+static volatile bool s_pyxis_wifi_kick_pending = false;
+void pyxis_host_wifi_kick() { s_pyxis_wifi_kick_pending = true; }
+
+#ifdef HYBRID_TEST_HOOKS
+// Non-T: serial lines from the service's line reader → MeshCore CLI.
+// Called on the pyxis_svc task (core 1); handleCommand is what the mesh
+// CLI itself runs, guarded by the same lock discipline (MESH_LOCK).
+// "NOTIF" is intercepted first: dumps the C-side notification store
+// (notify.cpp ring — mutex-guarded, any-task-safe) for harness
+// inspection of exactly what the topbar drop-down would render.
+void pyxis_host_serial_line(const char* line) {
+  if (strcmp(line, "NOTIF") == 0) {
+    int n = notify_log_count();
+    Serial.printf("T:OK count=%d unseen=%u\n", n, (unsigned)notify_log_unseen());
+    for (int i = 0; i < n; i++) {
+      uint32_t ts = 0;
+      char buf[192];
+      if (notify_log_get(i, &ts, buf, sizeof(buf)))
+        Serial.printf("T:NOTIF ts=%lu %s\n", (unsigned long)ts, buf);
+    }
+    return;
+  }
+  if (!the_mesh) return;
+  MESH_LOCK();
+  the_mesh->handleCommand(line);
+  MESH_UNLOCK();
+}
+#endif
+
+// Drain Pyxis service events on core 0. M4: log (unchanged) + feed the
+// test-hook RX ring (unchanged) + dispatch into lib/rns.lua's __dispatch_*
+// functions via rns_bridge_dispatch (same pattern as drain_rx_events /
+// lua_mesh_push_*) — skipped while the Lua VM is torn down (ELF run).
+static void drain_rns_events() {
+  QueueHandle_t q = pyxis_event_queue();
+  if (!q) return;
+  PyxisEvent ev;
+  int budget = 8;
+  while (budget-- > 0 && xQueueReceive(q, &ev, 0) == pdTRUE) {
+    switch (ev.kind) {
+      case PyxisEvent::MSG_RECEIVED:
+        SLog.printf("[rns] msg from %.16s: %s\n", ev.peer_hash, ev.text);
+        // Unified bell: RNS messages join the same C-side notification
+        // store the mesh DM/mention alerts use, so the topbar drop-down
+        // shows both worlds (and survives Lua teardown during ELF runs).
+        {
+          char nbuf[192];
+          snprintf(nbuf, sizeof(nbuf), "RNS %.8s…: %s", ev.peer_hash, ev.text);
+          notify_post(nbuf);
+        }
+#ifdef HYBRID_TEST_HOOKS
+        pyxis_test_record_rx_event(ev);
+#endif
+        break;
+      case PyxisEvent::MSG_DELIVERED:
+        SLog.printf("[rns] delivered %.16s\n", ev.peer_hash);
+        break;
+      case PyxisEvent::ANNOUNCE:
+        SLog.printf("[rns] announce %.16s (%s)\n", ev.peer_hash, ev.peer_name);
+        break;
+      case PyxisEvent::RNS_STATUS:
+        SLog.printf("[rns] status: %s\n", ev.text);
+        break;
+      case PyxisEvent::MISSED_CALL: {
+        char nbuf[64];
+        snprintf(nbuf, sizeof(nbuf), "Missed call from %.16s…", ev.peer_hash);
+        notify_post(nbuf);
+        break;
+      }
+      default: break;
+    }
+    if (L) rns_bridge_dispatch(L, ev);
+    if (L) phone_bridge_dispatch(L, ev);
+  }
+}
+
 void setup() {
   // Enlarge the UART TX buffer so the ISR drains it in the background and SLog's
   // best-effort writes (availableForWrite-gated) almost never have to drop. Must
@@ -8259,6 +8363,17 @@ void setup() {
   SLog.printf("[MESH] Pub key: %s\n", pk_hex);
   log_boot_mem("after mesh begin");
 
+  // Hybrid: start the RNS service BEFORE the UI stack (D11 doctrine,
+  // extended 2026-07-22 after AutoInterface starved at steady state).
+  // The service's internal-RAM residents — lwIP sockets, interface
+  // objects, task stack, audio pre-allocation — claim contiguous heap
+  // here; LVGL/Lua churn then fragments what's left, which only
+  // PSRAM-tolerant consumers draw on. Starting last was leaving the
+  // service ~7KB largest-block at steady state (announce guard trips).
+  // Init runs async on the core-1 service task; nothing here needs
+  // LVGL, Lua, or the mesh task (serial forward guards on the_mesh).
+  pyxis_service_start();
+
   //Initialize the disply only after all other spi bus setup is finished
   SLog.println("Initialize display");
   tft.begin();
@@ -8329,6 +8444,9 @@ void setup() {
                 xPortGetCoreID());
   meshpunk_spawn_mesh_task();
   meshpunk_spawn_gps_task();
+
+  // Hybrid phone: bring up the Reticulum/LXMF service last (own task on
+  // Core 1, prio 2 — HYBRID_PLAN D2). NVS-gated via pyxis/rns_en.
   log_boot_mem("setup done");
 }
 
@@ -8470,6 +8588,17 @@ void loop() {
   // Flush mesh RX events into Lua. lua_State is single-threaded — always
   // touched from Core 0.
   drain_rx_events();
+
+  // Hybrid phone: flush Pyxis service events (log-only until the Lua
+  // bindings land) and run any service-requested WiFi connect round.
+  drain_rns_events();
+  if (s_pyxis_wifi_kick_pending) {
+    s_pyxis_wifi_kick_pending = false;
+    wifi_auto_kick();
+  }
+  // M3 voice: execute any pending ES7210 register I/O here on core 0 —
+  // the mic ADC shares the Wire bus with touch/keyboard (HYBRID_PLAN D5).
+  pyxis_call_core0_service();
 
   // Mic-key notifications shortcut (flag set by the keyboard reader).
   dispatch_topbar_shortcut();

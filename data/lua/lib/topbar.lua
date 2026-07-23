@@ -168,6 +168,20 @@ local function open_panel()
 
     panel:Label { text = "Notifications", w = lvgl.PCT(100), h = 20 }
 
+    -- Hybrid: the badge count includes MeshCore unread mail, but only
+    -- DM/@mention alerts post detail lines (channel chatter is gated by
+    -- per-channel notify modes). Reconcile with a summary line so the
+    -- panel always accounts for what the badge counted.
+    do
+        local mok, munread = pcall(_mesh_unread_total)
+        if mok and type(munread) == "number" and munread > 0 then
+            panel:Label {
+                text = "MeshCore: " .. munread .. " unread - see Messenger",
+                w = lvgl.PCT(100), h = 18,
+            }
+        end
+    end
+
     local rows = panel:Object {
         w = lvgl.PCT(100), h = 138, bg_opa = 0, border_width = 0, pad_all = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },

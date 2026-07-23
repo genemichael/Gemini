@@ -5792,6 +5792,10 @@ void PunkMesh::loop()
         savePathHistory();
     }
 
+#ifndef HYBRID_TEST_HOOKS
+    // Hybrid test builds: the pyxis service task is the SOLE Serial line
+    // reader (HYBRID_PLAN D11); it forwards non-T: lines to handleCommand
+    // via pyxis_host_serial_line, so this byte reader is compiled out.
     int len = strlen(command);
     while (Serial.available() && len < sizeof(command) - 1)
     {
@@ -5815,4 +5819,5 @@ void PunkMesh::loop()
         handleCommand(command);
         command[0] = 0; // reset command buffer
     }
+#endif  // HYBRID_TEST_HOOKS
 }

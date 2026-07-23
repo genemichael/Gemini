@@ -10,3 +10,4 @@ releases
 pack
 Todo.txt
 docs
+__pycache__/

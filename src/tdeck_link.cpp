@@ -601,11 +601,17 @@ static void tdl_task_body(void*) {
             // switched to OTG host mode (reads simply return nothing). The
             // guard clears a full post-starvation backlog in one pass (the
             // enlarged CDC RX buffer can hold seconds of link traffic).
+#ifndef HYBRID_TEST_HOOKS
+            // Hybrid test builds: Serial belongs exclusively to the pyxis
+            // service's T: harness (HYBRID_PLAN D11); the device-role tdl
+            // drain is compiled out so it can't steal harness bytes. USB
+            // host mode (s_usb_backend) is unaffected.
             int guard = 4096;
             while (guard-- > 0 && Serial.available() > 0) {
                 int c = Serial.read();
                 if (c >= 0) parse_byte((uint8_t)c);
             }
+#endif
         }
 
         uint32_t now = millis();
