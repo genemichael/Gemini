@@ -271,10 +271,13 @@ local function refresh_ble()
 end
 refresh_ble()
 
+-- Phone mode: toggle shown but DISABLED (owner decision 2026-07-23).
+-- BLE must stay off — WiFi modem sleep is disabled for RNS multicast
+-- reliability, and the ESP32 aborts if BLE runs with sleep off.
+btn_ble:add_state(lvgl.STATE.DISABLED)
+lbl_ble.text = "OFF (phone mode)"
 btn_ble:onClicked(function()
-    _ble_set_enabled(not ble_on)
-    refresh_ble()
-    status.text = "BLE: " .. (ble_on and "ON" or "OFF")
+    status.text = "BLE is disabled while RNS phone mode is active"
 end)
 
 -- Bond clear toggle

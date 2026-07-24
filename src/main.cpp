@@ -627,6 +627,10 @@ static void wifi_auto_on_scan_done(int n) {
   SLog.printf("[WIFI] connecting to %s (%d known network(s) in range)\n",
               wifi_saved_ssid[idx].c_str(), wa_cand_count);
   { UsbFlashGuard _g; WiFi.begin(wifi_saved_ssid[idx].c_str(), wifi_saved_pass[idx].c_str()); }
+  // Phone mode: modem sleep OFF — sleep windows miss IPv6 ND multicast
+  // (AutoInterface errno=118 flaps, observed 2026-07-23). Legal ONLY
+  // because BLE is forced off (ESP32 aborts if BLE runs w/ sleep off).
+  WiFi.setSleep(false);
   wa_state = WA_CONNECTING;
   wa_deadline = millis() + 10000;
 }
@@ -696,6 +700,10 @@ static void wifi_auto_tick() {
         int idx = wa_cand[wa_cand_next++];
         SLog.printf("[WIFI] trying next candidate: %s\n", wifi_saved_ssid[idx].c_str());
         { UsbFlashGuard _g; WiFi.begin(wifi_saved_ssid[idx].c_str(), wifi_saved_pass[idx].c_str()); }
+  // Phone mode: modem sleep OFF — sleep windows miss IPv6 ND multicast
+  // (AutoInterface errno=118 flaps, observed 2026-07-23). Legal ONLY
+  // because BLE is forced off (ESP32 aborts if BLE runs w/ sleep off).
+  WiFi.setSleep(false);
         wa_deadline = now + 10000;
       } else {
         wifi_auto_fail_round();
@@ -6952,6 +6960,15 @@ void setupLuaVGL() {
   });
   lua_register(L, "_ble_set_enabled", [](lua_State* L) -> int {
     bool v = lua_toboolean(L, 1);
+    // Phone mode: refuse to enable BLE. WiFi modem sleep is off for
+    // RNS multicast reliability, and the ESP32 ABORTS at runtime if
+    // BLE starts while sleep is disabled (pyxis main.cpp:650 lesson).
+    // UI toggle is disabled too; this is the belt-and-braces layer.
+    if (v) {
+      SLog.printf("[BLE] enable refused: phone mode (WiFi sleep off)\n");
+      lua_pushboolean(L, 0);
+      return 1;
+    }
     ble_enabled_pref = v;
     MESH_LOCK();
     if (v && !ble_serial) {

@@ -75,10 +75,15 @@ public:
 protected:
     virtual bool send_outgoing(const RNS::Bytes& data);
 
+public:
+    // HYBRID: public so the service can force a socket-down/reconnect
+    // when the user retargets host/port at runtime (T:TCP resave) —
+    // start() no-ops once the task exists, so this is the only lever.
+    void disconnect();
+
 private:
     // Connection management
     bool connect();
-    void disconnect();
     void configure_socket();
     void handle_disconnect();
 

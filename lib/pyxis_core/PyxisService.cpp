@@ -255,9 +255,14 @@ static void start_tcp_interface() {
         }
         RNS::Transport::register_interface(*s_tcp_if);   // pyxis:1393-1396
     } else {
+        // Resave with a live interface: force the socket down first so
+        // the background task reconnects against the (possibly new)
+        // target — start() alone no-ops when the task already runs.
         s_tcp_impl->set_target_host(s_cfg.tcp_host.c_str());
         s_tcp_impl->set_target_port(s_cfg.tcp_port);
+        s_tcp_impl->disconnect();
         s_tcp_impl->start();
+        Serial.println("[pyxis] TCP retarget: forced reconnect");
     }
 }
 
@@ -342,7 +347,12 @@ static bool service_init() {
     // store init and every announce fails to enter the path table.
     // pyxis:853-864.
     RNS::Reticulum::transport_enabled(true);
-    RNS::loglevel(RNS::LOG_WARNING);   // launcher serial is busy; keep RNS quiet
+    // LOG_INFO (was WARNING): with AutoInterface off by default the RNS
+    // log volume is small, and WARNING-only made every TCP connect
+    // attempt/failure INVISIBLE — the interface sat offline for days
+    // with zero log evidence (diagnosed 2026-07-23). INFO is what shows
+    // "Connected to <host>" / "Initial connection failed".
+    RNS::loglevel(RNS::LOG_INFO);
 
     load_or_create_identity();
     strlcpy(s_identity_hex, s_identity->hash().toHex().c_str(),
@@ -687,6 +697,22 @@ static void handle_test_command(const String& line) {
                           (WiFi.status() == WL_CONNECTED)
                               ? "connecting" : "saved (connects when WiFi up)");
         }
+    } else if (cmd == "T:AUTO") {
+        // Owner decision 2026-07-23: AutoInterface optional (congested
+        // 2.4GHz LANs flap its multicast carrier). T:AUTO on|off
+        // persists; takes effect at next boot (no live interface
+        // detach). With auto off, TCP is the only path.
+        if (args == "on" || args == "off") {
+            s_cfg.auto_en = (args == "on");
+            Preferences p;
+            p.begin("pyxis", false);
+            p.putBool("auto_en", s_cfg.auto_en);
+            p.end();
+            Serial.printf("T:OK auto_en=%d - REBOOT to apply\n", s_cfg.auto_en ? 1 : 0);
+        } else {
+            Serial.printf("T:OK auto_en=%d running=%d\n", s_cfg.auto_en ? 1 : 0,
+                          (s_auto_if && s_auto_if->online()) ? 1 : 0);
+        }
     } else if (cmd == "T:IDEXPORT") {
         // RNS identity migration (device→device). The 64-byte private
         // key as 128 hex chars — this IS the user's whole RNS persona;
@@ -1030,6 +1056,24 @@ bool pyxis_set_tcp(bool enabled, const char* host, uint16_t port) {
     cmd.text = host ? host : "";
     cmd.port = port;
     return run_cmd(cmd);
+}
+
+bool pyxis_set_auto_en(bool enabled) {
+    // Plain bool + thread-safe NVS: no marshalling needed — the gate
+    // is only consulted at (re)start, same reboot-to-apply semantics
+    // as T:AUTO.
+    s_cfg.auto_en = enabled;
+    Preferences p;
+    p.begin("pyxis", false);
+    p.putBool("auto_en", enabled);
+    p.end();
+    return true;
+}
+
+bool pyxis_get_auto_en(bool* enabled, bool* running) {
+    if (enabled) *enabled = s_cfg.auto_en;
+    if (running) *running = (s_auto_if && s_auto_if->online());
+    return true;
 }
 
 bool pyxis_get_tcp(bool* enabled, char host_out[64], uint16_t* port,

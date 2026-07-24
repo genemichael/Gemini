@@ -88,3 +88,8 @@ bool pyxis_get_display_name(char out[32]);
 bool pyxis_set_tcp(bool enabled, const char* host, uint16_t port);
 bool pyxis_get_tcp(bool* enabled, char host_out[64], uint16_t* port,
                    bool* online);
+// AutoInterface on/off (owner decision 2026-07-23: optional — congested
+// 2.4GHz LANs flap its multicast carrier). Persists to NVS; takes
+// effect at next boot (interfaces are not detached live).
+bool pyxis_set_auto_en(bool enabled);
+bool pyxis_get_auto_en(bool* enabled, bool* running);

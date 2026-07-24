@@ -132,7 +132,8 @@ private:
     struct in6_addr _link_local_address;
     std::string _link_local_address_str;
     std::string _multicast_address_str;   // For logging
-    bool _data_socket_ok = false;         // Data socket initialized successfully
+    bool _data_socket_ok = false;
+    bool _addr_was_lost = false;   // hybrid: force rebind when link-local returns identical         // Data socket initialized successfully
 #ifdef ARDUINO
     IPv6Address _link_local_ip;           // ESP32: link-local as IPv6Address
     IPv6Address _multicast_ip;            // ESP32: multicast as IPv6Address

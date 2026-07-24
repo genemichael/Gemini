@@ -30,11 +30,31 @@ back_btn:onClicked(function() apps.go_home() end)
 local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
 
 content:Label { text = "-- AutoInterface (WiFi LAN) --", w = lvgl.PCT(100), h = 16 }
-content:Label {
-    text = rns:available() and "Always on. Peers on this WiFi are reached directly."
-                            or "Waiting for WiFi / service...",
-    w = lvgl.PCT(100), h = 16,
-}
+
+-- Optional since 2026-07-23: on congested 2.4GHz networks its
+-- multicast carrier flaps; TCP below is the reliable alternative.
+-- Toggle persists via rns:setAuto(); takes effect at next reboot.
+local auto = rns:getAuto()
+local auto_enabled = auto.enabled
+local auto_btn = content:Button { w = lvgl.PCT(44), h = 30 }
+local auto_lbl = auto_btn:Label { text = "", align = lvgl.ALIGN.CENTER }
+local function refresh_auto()
+    auto_lbl:set { text = auto_enabled and "Enabled: yes" or "Enabled: no" }
+end
+refresh_auto()
+auto_btn:onClicked(function()
+    auto_enabled = not auto_enabled
+    if rns:setAuto(auto_enabled) then
+        refresh_auto()
+        status:set { text = "AutoInterface " ..
+            (auto_enabled and "on" or "off") .. " - reboot to apply" }
+    else
+        auto_enabled = not auto_enabled
+        status:set { text = "Save failed (service offline?)" }
+    end
+end)
+local auto_state = content:Label { w = lvgl.PCT(52), h = 30,
+    text = auto.running and "running" or "not running" }
 
 content:Label { text = "-- TCP transport (optional) --", w = lvgl.PCT(100), h = 16 }
 

@@ -440,13 +440,21 @@ void AutoInterface::check_link_local_address() {
     // Check for valid address (not all zeros)
     if (current_ip[0] == 0 && current_ip[1] == 0) {
         WARNING("AutoInterface: Lost IPv6 address");
+        _addr_was_lost = true;   // force a socket rebuild on re-acquire
         return;
     }
 
-    // Compare with stored address
-    if (current_ip == _link_local_ip) {
+    // Compare with stored address. HYBRID FIX (2026-07-23): the ESP32
+    // link-local is MAC-derived (EUI-64), so after an interface bounce
+    // it returns BYTE-IDENTICAL — the old "no change" early-return then
+    // skipped the rebind forever while the sockets stayed dead
+    // (continuous errno=118 observed on device). If the address was
+    // lost since the last check, fall through and rebind even when the
+    // bytes match.
+    if (current_ip == _link_local_ip && !_addr_was_lost) {
         return;  // No change
     }
+    _addr_was_lost = false;
 
     // Address changed!
     std::string old_addr_str = _link_local_address_str;

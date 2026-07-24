@@ -141,6 +141,21 @@ static int lua_rns_set_tcp(lua_State* L) {
     return 1;
 }
 
+// _rns_get_auto() -> enabled(bool), running(bool)
+static int lua_rns_get_auto(lua_State* L) {
+    bool en = true, running = false;
+    pyxis_get_auto_en(&en, &running);
+    lua_pushboolean(L, en ? 1 : 0);
+    lua_pushboolean(L, running ? 1 : 0);
+    return 2;
+}
+
+// _rns_set_auto(enabled) -> bool. Persists; applies at next boot.
+static int lua_rns_set_auto(lua_State* L) {
+    lua_pushboolean(L, pyxis_set_auto_en(lua_toboolean(L, 1)) ? 1 : 0);
+    return 1;
+}
+
 void rns_bridge_register(lua_State* L) {
     lua_register(L, "_rns_running",  lua_rns_running);
     lua_register(L, "_rns_identity", lua_rns_identity);
@@ -151,6 +166,8 @@ void rns_bridge_register(lua_State* L) {
     lua_register(L, "_rns_set_name", lua_rns_set_name);
     lua_register(L, "_rns_get_tcp",  lua_rns_get_tcp);
     lua_register(L, "_rns_set_tcp",  lua_rns_set_tcp);
+    lua_register(L, "_rns_get_auto", lua_rns_get_auto);
+    lua_register(L, "_rns_set_auto", lua_rns_set_auto);
 }
 
 // ── C++ -> Lua dispatch (one function per PyxisEvent kind) ─────────────────

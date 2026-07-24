@@ -195,6 +195,20 @@ function M:getTcp()
     return { enabled = en, host = host or "", port = port or 4965, online = online }
 end
 
+-- AutoInterface (IPv6 multicast peer discovery). Optional since
+-- 2026-07-23: congested 2.4GHz networks flap its carrier. setAuto
+-- persists; takes effect at next boot.
+function M:getAuto()
+    local ok, en, running = pcall(_rns_get_auto)
+    if not ok then return { enabled = true, running = false } end
+    return { enabled = en, running = running }
+end
+
+function M:setAuto(enabled)
+    local ok, res = pcall(_rns_set_auto, enabled and true or false)
+    return ok and res or false
+end
+
 function M:setTcp(enabled, host, port)
     local ok, res = pcall(_rns_set_tcp, enabled and true or false,
                           tostring(host or ""), tonumber(port) or 4965)
