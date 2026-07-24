@@ -54,6 +54,16 @@ TCPClientInterface::TCPClientInterface(const char* name /*= "TCPClientInterface"
     // immediately; otherwise the initial connect could be delayed up to
     // RECONNECT_WAIT_MS. Unsigned wraparound keeps this correct when
     // millis() < RECONNECT_WAIT_MS.
+    // HYBRID FIX (2026-07-24): start() is called again on every host/
+    // port retarget — without this guard each call spawned ANOTHER
+    // 6KB worker task, leaking internal RAM until the heap collapsed
+    // (observed on device: 27KB→7KB after a few retargets). The
+    // existing worker picks up the new target on its next reconnect.
+    if (_task_running) {
+        _last_connect_attempt = millis() - RECONNECT_WAIT_MS;
+        INFO("TCPClientInterface: worker already running, retargeting");
+        return true;
+    }
     _last_connect_attempt = millis() - RECONNECT_WAIT_MS;
     _task_running = true;
     BaseType_t r = xTaskCreatePinnedToCore(tcp_task, "tcp", 6144, this, 1, &_task_handle, 0);
@@ -85,7 +95,10 @@ bool TCPClientInterface::connect() {
     // 3-arg connect bounds the blocking time (the 2-arg form ignores it and can
     // block ~18.5s on an unreachable host). Runs on tcp_task, off the main loop.
     if (!_client.connect(_target_host.c_str(), _target_port, CONNECT_TIMEOUT_MS)) {
-        DEBUG("TCPClientInterface: Connection failed");
+        // INFO not DEBUG: per-attempt failures were invisible at the
+        // service's LOG_INFO level while the worker retried for hours.
+        INFO("TCPClientInterface: connect attempt failed (host=" +
+             _target_host + ")");
         return false;
     }
 
@@ -285,7 +298,20 @@ void TCPClientInterface::task_loop() {
             uint32_t now = millis();
             if (now - _last_connect_attempt >= RECONNECT_WAIT_MS) {
                 _last_connect_attempt = now;
-                if (ESP.getMaxAllocHeap() >= 20000) {  // skip under heap pressure
+                // HYBRID FIX (2026-07-24): was >= 20000 — a pyxis-world
+                // threshold. The launcher's largest block sits at
+                // 13-16KB BY DESIGN (D11 budget), so 20KB silently
+                // vetoed every reconnect after early boot: connect
+                // worked only when WiFi beat the UI's heap churn (the
+                // "worked yesterday, never today" mystery). 8KB covers
+                // the socket + TLS-free connect path with margin; and
+                // the skip now logs instead of hiding.
+                uint32_t max_block = ESP.getMaxAllocHeap();
+                if (max_block < 8192) {
+                    INFO("TCPClientInterface: connect deferred, low heap (max_block=" +
+                         std::to_string(max_block) + ")");
+                }
+                if (max_block >= 8192) {
                     _conn_state.store(CONNECTING);      // claim _client
                     if (connect()) {
                         _frame_buffer.clear();
