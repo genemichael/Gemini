@@ -2,7 +2,7 @@
 is based on a highly-modified fork of MeshPunk, and utilizes
 [Torlando's fork of microReticulum](https://github.com/torlando-tech/microReticulum/tree/6054f6ba82367628a85cd07fcb668b95e947f046)
  of
-[microReticulum](https://github.com/attermann/microReticulum) as a service. 
+[microReticulum](https://github.com/attermann/microReticulum) as a service. Thhis is named Mesh Gemini because Pyxis is named after the constellation, and this incorporates two mesh environments.
 
 Claude Code did almost all of the heavy lifting.
 
