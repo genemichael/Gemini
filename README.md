@@ -1,5 +1,4 @@
-# Gemini
-
+## Mesh Gemini
 is based on a highly-modified fork of MeshPunk, and utilizes
 [Torlando's fork of microReticulum](https://github.com/torlando-tech/microReticulum/tree/6054f6ba82367628a85cd07fcb668b95e947f046)
  of
@@ -7,8 +6,8 @@ is based on a highly-modified fork of MeshPunk, and utilizes
 
 Claude Code did almost all of the heavy lifting.
 
-Gemini is a real mesh phone on ESP32. Voice calls, multi-network text
-messaging on a standalone device. Gemini provides T-Deck users a unified
+Mesh Gemini is a real mesh phone on ESP32. Voice calls, multi-network text
+messaging on a standalone device. Mesh Gemini provides T-Deck users a unified
 mesh experience facilitating voice calls over LXST, and text messaging
 over either LXMF or MeshCore. Calls connect and carry two-way audio
 today; quality tuning is on the roadmap.
