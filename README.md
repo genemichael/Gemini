@@ -2,7 +2,7 @@
 
 is based on a highly-modified fork of MeshPunk, and utilizes
 [Torlando's fork of microReticulum](https://github.com/torlando-tech/microReticulum/tree/6054f6ba82367628a85cd07fcb668b95e947f046)
-(pinned at the exact commit this firmware builds against) of
+ of
 [microReticulum](https://github.com/attermann/microReticulum) as a service.
 
 Claude Code did almost all of the heavy lifting.
@@ -112,7 +112,7 @@ applies to the combination, which incorporates GPL-3.0 code from Pyxis.
 - Original MeshPunk firmware, which this project is forked from and builds upon:
   - Ben Nolan — https://github.com/bnolan
   - Cameron L — https://github.com/mueslimak3r
-- MeshCore — https://github.com/ripplebiz/MeshCore (the LoRa mesh side)
+- MeshCore — https://github.com/meshcore-dev/MeshCore 
 - Torlando ([Pyxis](https://github.com/torlando-tech/pyxis/))
 - Attermann ([microReticulum](https://github.com/attermann/microReticulum) and [microStore](https://github.com/attermann/microStore))
 - Mark Qvist ([Reticulum](https://github.com/markqvist/Reticulum))
