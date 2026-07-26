@@ -1,5 +1,5 @@
 # Gemini is based on a highly-modified fork of MeshPunk, and utilizes Torlando’s [highly modified fork](https://github.com/torlando-tech/microReticulum/tree/feat/t-deck) of [microReticulum](https://github.com/attermann/microReticulum) as a service. 
-
+Claude Code did almost all of the heavy lifting. 
 Gemini is a real mesh phone on ESP32. Voice calls, multi-network text messaging on a standalone device.  Gemini provides T-Deck users a unified mesh experience facilitating voice calls over LXST, and text messaging over either LXMF or MeshCore. 
 
 Reticulum owns the 2.4ghz interface, using either Auto Interface or TCP to manage connectivity. MeshCore owns the LoRa side. One unified address book for both LXMF and MeshCore contacts. 
