@@ -2,20 +2,20 @@
 is based on a highly-modified fork of MeshPunk, and utilizes
 [Torlando's fork of microReticulum](https://github.com/torlando-tech/microReticulum/tree/6054f6ba82367628a85cd07fcb668b95e947f046)
  of
-[microReticulum](https://github.com/attermann/microReticulum) as a service.
+[microReticulum](https://github.com/attermann/microReticulum) as a service. 
 
 Claude Code did almost all of the heavy lifting.
 
-Mesh Gemini is a real mesh phone on ESP32. Voice calls, multi-network text
+Mesh Gemini is a standalone mesh phone on ESP32. Voice calls, multi-network text
 messaging on a standalone device. Mesh Gemini provides T-Deck users a unified
 mesh experience facilitating voice calls over LXST, and text messaging
 over either LXMF or MeshCore. Calls connect and carry two-way audio
-today; quality tuning is on the roadmap.
+today; quality tuning is on the roadmap. 
 
 Reticulum owns the 2.4 GHz WiFi interface, using either AutoInterface or
 TCP to manage connectivity (selectable in Settings — TCP-only is a
 first-class mode for congested networks). MeshCore owns the LoRa side.
-One unified address book for both LXMF and MeshCore contacts.
+One unified address book for both LXMF and MeshCore contacts. No Blutetooth support.
 
 Because it is based on MeshPunk, any of the Lua apps available in that
 App Library are available to you here, as well.
@@ -65,6 +65,9 @@ python3 -m esptool --chip esp32s3 --port <PORT> --baud 460800 \
 - LilyGo T-Deck (Plus recommended — GPS features assume it)
 - Git (for submodules)
 
+## Suggested Materials
+- TF Card
+
 ## Building and Development
 
 0. `softwareupdate --install-rosetta` (macOS on Apple Silicon only — the
@@ -86,7 +89,7 @@ python3 -m esptool --chip esp32s3 --port <PORT> --baud 460800 \
    pio run --target uploadfs
    ```
    **WARNING: `uploadfs` replaces the entire data partition — your
-   MeshCore identity, saved WiFi networks, and preferences are wiped**
+   MeshCore identity, saved WiFi networks, and preferences are wiped unless backed up to a MTF card**
    (the RNS identity survives; it lives in NVS). On a `test` build,
    prefer `tools/push_lua.py` to update individual Lua files with no
    wipe. Close the serial monitor first either way or the upload fails.
