@@ -30,6 +30,26 @@ TCPClientInterface::TCPClientInterface(const char* name /*= "TCPClientInterface"
     _OUT = true;
     _bitrate = BITRATE_GUESS;
     _HW_MTU = HW_MTU;
+#ifdef ARDUINO
+    // BACKPORT (2026-08-07, WADAMESH_BACKPORT_BRIEF §3 bullet 2 +
+    // Addendum §3): claim the worker stack + TCB NOW, at construction.
+    // The service constructs this interface exactly once (D1: only
+    // when tcp_en && host set — unconfigured devices never reach this
+    // ctor, so they pay zero bytes), and this is the earliest and
+    // freshest heap moment the interface ever sees. start() then
+    // creates the task static, so no dynamic 6KB contiguous ask ever
+    // competes with the runtime heap. INTERNAL|8BIT is a HARD
+    // constraint for BOTH blocks: FreeRTOS asserts
+    // (xPortCheckValidTCBMem) on a PSRAM TCB (Wadamesh boot loop,
+    // 2026-07-31). Loud on failure; start() falls back to a dynamic
+    // spawn.
+    _worker_stack = heap_caps_malloc(TCP_WORKER_STACK,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    _worker_tcb   = heap_caps_malloc(sizeof(StaticTask_t),
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!_worker_stack || !_worker_tcb)
+        ERROR("TCPClientInterface: worker stack/TCB prealloc FAILED");
+#endif
 }
 
 /*virtual*/ TCPClientInterface::~TCPClientInterface() {
@@ -66,8 +86,24 @@ TCPClientInterface::TCPClientInterface(const char* name /*= "TCPClientInterface"
     }
     _last_connect_attempt = millis() - RECONNECT_WAIT_MS;
     _task_running = true;
-    BaseType_t r = xTaskCreatePinnedToCore(tcp_task, "tcp", 6144, this, 1, &_task_handle, 0);
-    if (r != pdPASS) {
+    // BACKPORT (2026-08-07, WADAMESH_BACKPORT_BRIEF §3 bullet 2): the
+    // worker's 6KB stack + TCB are claimed in the CONSTRUCTOR and the
+    // task is created static — no heap ask here. The retarget guard
+    // above is unchanged and still load-bearing: the static task is
+    // created at most once (2026-07-24 duplicate-worker fix), and with
+    // a single static stack a second create here would be corruption,
+    // not just a leak.
+    if (_worker_stack && _worker_tcb) {
+        _task_handle = xTaskCreateStaticPinnedToCore(
+            tcp_task, "tcp", TCP_WORKER_STACK / sizeof(StackType_t),
+            this, 1, (StackType_t*)_worker_stack,
+            (StaticTask_t*)_worker_tcb, 0);
+    } else {
+        // Ctor allocation failed (loudly logged there): dynamic fallback.
+        BaseType_t r = xTaskCreatePinnedToCore(tcp_task, "tcp", 6144, this, 1, &_task_handle, 0);
+        if (r != pdPASS) _task_handle = nullptr;
+    }
+    if (_task_handle == nullptr) {
         ERROR("TCPClientInterface: Failed to create connect task");
         _task_running = false;
         return false;
@@ -306,6 +342,21 @@ void TCPClientInterface::task_loop() {
                 // "worked yesterday, never today" mystery). 8KB covers
                 // the socket + TLS-free connect path with margin; and
                 // the skip now logs instead of hiding.
+                // GATE RE-EXAMINED 2026-08-07 (WADAMESH_BACKPORT_BRIEF
+                // §3 bullet 2, threshold rule): KEPT at 8192. The
+                // worker stack moved to the ctor, but this gate runs ON
+                // the worker task, so the 6KB stack was already
+                // allocated before every evaluation the 8K was ever
+                // measured against — TESTLOG 2026-07-24 sized 8K
+                // against the connect-time draw only (socket/lwIP,
+                // TLS-free, plus margin; verified connecting at
+                // largest=16372). The pre-claim removes no term from
+                // that budget, so no re-derivation is licensed.
+                // Wadamesh's 4096 was derived from ITS measured
+                // 7,668-largest plateau — not this host's numbers.
+                // Lowering below 8192 needs an on-device largest-block
+                // measurement before/after connect() with the
+                // pre-claim in place.
                 uint32_t max_block = ESP.getMaxAllocHeap();
                 if (max_block < 8192) {
                     INFO("TCPClientInterface: connect deferred, low heap (max_block=" +

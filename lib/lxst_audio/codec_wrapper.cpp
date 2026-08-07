@@ -7,10 +7,18 @@
 
 #ifdef ARDUINO
 #include <esp_log.h>
+#include <Arduino.h>
 static const char* TAG = "LXST:Codec2";
 #define LOGI(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
 #define LOGW(fmt, ...) ESP_LOGW(TAG, fmt, ##__VA_ARGS__)
-#define LOGE(fmt, ...) ESP_LOGE(TAG, fmt, ##__VA_ARGS__)
+// LOGE also prints to Serial: errors here (create fail, mode-switch fail)
+// kill the call, and ESP_LOGE alone is compiled out at the production
+// CORE_DEBUG_LEVEL=0 (wadamesh lesson, WADAMESH_BACKPORT_BRIEF.md §3).
+// Both LOGE sites are cold paths — create() and a rare mode switch.
+#define LOGE(fmt, ...) do { \
+        ESP_LOGE(TAG, fmt, ##__VA_ARGS__); \
+        Serial.printf("[C2] ERROR: " fmt "\n", ##__VA_ARGS__); \
+    } while (0)
 #else
 #include <cstdio>
 #define LOGI(fmt, ...) printf("[INFO] " fmt "\n", ##__VA_ARGS__)

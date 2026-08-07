@@ -98,6 +98,20 @@ private:
     static void tcp_task(void* arg);
     void task_loop();
     TaskHandle_t _task_handle = nullptr;
+    // BACKPORT (2026-08-07, WADAMESH_BACKPORT_BRIEF §3 bullet 2):
+    // boot-claimed static worker stack + TCB (see ctor). BOTH must be
+    // INTERNAL heap: this build routes RNS allocations through the
+    // PSRAM allocators (platformio.ini RNS_DEFAULT_ALLOCATOR=
+    // RNS_PSRAM_ALLOCATOR), and FreeRTOS asserts
+    // (xPortCheckValidTCBMem) on a PSRAM-resident TCB — an embedded
+    // member TCB boot-looped the Wadamesh device on 2026-07-31.
+    // Never freed: the service constructs this interface at most once
+    // per boot (PyxisService s_tcp_impl is never deleted), and freeing
+    // the TCB after a static task's self-delete would race the idle
+    // task's cleanup.
+    static constexpr size_t TCP_WORKER_STACK = 6144;
+    void* _worker_stack = nullptr;
+    void* _worker_tcb   = nullptr;   // StaticTask_t, internal heap
     std::atomic<bool> _task_running{false};
     std::atomic<bool> _task_done{false};   // task sets this right before exit; stop() joins on it
     std::atomic<uint8_t> _conn_state{DISCONNECTED};

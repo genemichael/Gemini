@@ -106,7 +106,28 @@ static Bytes s_dest_hash;                 // peer lxst destination hash
 static uint32_t s_start_ms = 0;
 static uint32_t s_timeout_ms = 0;
 static bool s_muted = false;
-static int  s_preferred_profile = LXST_PROFILE_ULBW;   // UIM.cpp:23-27
+static int  s_preferred_profile = LXST_PROFILE_LBW;    // was ULBW (UIM.cpp:23-27);
+    // 3200 default per Gene 2026-08-07: matches wadamesh, decodable by
+    // both embedded RX paths (PROFILE_AUDIT.md §4 — a 10-frame 700C
+    // batch overflows every embedded decode buffer), ~10x cheaper CPU.
+// Profile negotiation state (PROFILE_AUDIT.md §6, with the 3200-only
+// adoption clamp per Gene 2026-08-07): the peer's announced profile,
+// adopted only if it is LBW/3200 — the sole profile decodable within
+// the pcm[2048] RX scratch (a 10-frame 700C batch decodes to 3200
+// samples, §4b; 40ms modes are also the WDT territory of §4d). -1 =
+// nothing adoptable received; both reset per-call in call_ended().
+static int  s_remote_profile = -1;
+static bool s_profile_acked = false;   // reply-at-most-once guard (§2 storm kill)
+
+// Effective profile for this call: the adopted remote if one was
+// accepted, else our own preference. Used for codec init and for the
+// profile signals we send — echoing the effective value (never
+// restating our own against an adopted one) is what terminates the
+// profile-signal exchange (§6).
+static int effective_profile() {
+    return (s_remote_profile >= 0) ? s_remote_profile : s_preferred_profile;
+}
+
 static uint32_t s_tx_count = 0, s_rx_count = 0;
 static volatile bool s_link_closed_pending = false;
 
@@ -148,9 +169,20 @@ static inline int pcm_buffered() {
 static void mixer_pull_cb(int16_t* out, int count) {
     constexpr float STEP = 8000.0f / 11025.0f;
     for (int i = 0; i < count; i++) {
-        if (!s_playing || pcm_buffered() < 2) {
+        // Re-arm on drain (PROFILE_AUDIT.md §4d; Columba garble,
+        // TESTLOG Live-bench 2026-08-07 underrun=27807/~40s): when the
+        // ring starves mid-playback, drop back behind the prebuffer
+        // gate instead of zero-stuffing per sample — the decoder path
+        // re-sets s_playing once s_prebuffer_samples refill, so jitter
+        // gaps become brief pauses rather than per-sample chatter.
+        // NOTE: s_underruns now counts drain EVENTS (one per re-arm),
+        // no longer starved output samples.
+        if (s_playing && pcm_buffered() < 2) {
+            s_playing = false;
+            s_underruns++;
+        }
+        if (!s_playing) {
             out[i] = 0;
-            if (s_playing) s_underruns++;
             continue;
         }
         int r = s_pcm_r;
@@ -233,11 +265,27 @@ static void post_state_event() {
 // allocates approximately nothing from internal heap.
 
 // Per-stage internal-heap logging: turns any allocation failure during
-// call setup into a named, quantified report.
+// call setup into a named, quantified report. The dma=free/largest
+// columns track MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL separately: WiFi RX
+// can exhaust the DMA-capable pool while generic-internal looks
+// healthy (WADAMESH_BACKPORT_BRIEF.md Addendum §4; format matches
+// wadamesh's log_int_heap).
 static void log_int_heap(const char* stage) {
-    Serial.printf("[call][mem] %-12s int free=%u largest=%u\n", stage,
+    Serial.printf("[call][mem] %-12s int free=%u largest=%u dma=%u/%u\n", stage,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    // DIAGNOSTIC (2026-08-07, answer-time crash hunt): synchronous drain so
+    // each stage line reaches the host BEFORE the next stage runs — a panic
+    // otherwise loses the 8KB TX buffer and with it the crash bracket.
+    Serial.flush();
+}
+
+// DIAGNOSTIC (same hunt): flushed breadcrumb for non-stage checkpoints.
+static void diag_mark(const char* what) {
+    Serial.printf("[call][diag] %s\n", what);
+    Serial.flush();
 }
 
 // Boot-time reservation. Runs on the service task during service init;
@@ -313,9 +361,11 @@ static bool audio_start(int codec_mode) {
     log_int_heap("enc config");
     s_capture->setMute(s_muted);
     if (!s_capture->start()) {
-        Serial.printf("[call] capture start FAILED (int free=%u largest=%u)\n",
+        Serial.printf("[call] capture start FAILED (int free=%u largest=%u dma=%u/%u)\n",
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
         audio_stop_and_free();
         return false;
     }
@@ -395,7 +445,23 @@ static void call_on_packet(const Bytes& data) {            // UIM:1241
             signal = ((int)buf[4] << 8) | buf[5];
         if (signal < 0) return;
         if (signal >= LXST_PREFERRED_PROFILE) {            // UIM:1294-1303
-            call_send_signal(LXST_PREFERRED_PROFILE + s_preferred_profile);
+            // Negotiation + storm kill (PROFILE_AUDIT.md §6, 3200-only
+            // adoption clamp per Gene 2026-08-07). The old reply-always
+            // branch echoed between two firmware engines for the whole
+            // call, flooding the 8-deep signal queue — answer signals
+            // drowned, caller stuck at RINGING while the callee went
+            // ACTIVE (TESTLOG Live-bench 2026-08-07). Adopt LBW/3200
+            // only (never 40ms modes — pcm[2048] scratch + WDT, §4);
+            // reply AT MOST ONCE per call with the EFFECTIVE profile,
+            // so even against an unpatched echo-always peer every
+            // exchange is bounded (it replies to our single ack; we
+            // never reply again).
+            int remote = signal - LXST_PREFERRED_PROFILE;
+            if (remote == LXST_PROFILE_LBW) s_remote_profile = remote;
+            if (!s_profile_acked) {
+                s_profile_acked = true;
+                call_send_signal(LXST_PREFERRED_PROFILE + effective_profile());
+            }
             return;
         }
         uint8_t w = s_sigq_w, next = (w + 1) % SIGQ;
@@ -455,6 +521,8 @@ static void call_ended(bool missed = false) {
     post_state_event();   // "IDLE"
     s_peer_hash = Bytes();
     s_dest_hash = Bytes();
+    s_remote_profile = -1;      // per-call negotiation state (§6)
+    s_profile_acked = false;
     s_timeout_ms = 0;
 }
 
@@ -532,20 +600,26 @@ static void call_process_signal(uint8_t signal) {
             break;
         case CallState::RINGING:
             if (signal == LXST_STATUS_CONNECTING) {
+                diag_mark("answer: CONNECTING rx, pre audio_start");
                 s_state = CallState::CONNECTING;
                 post_state_event();
-                int mode = profile_to_codec2_mode(s_preferred_profile);
+                // §6: the callee's profile signal may already have
+                // arrived — use the converged (effective) profile.
+                int mode = profile_to_codec2_mode(effective_profile());
                 if (mode < 0) mode = CODEC2_MODE_700C;
                 if (!audio_start(mode)) { call_ended(); return; }
+                diag_mark("answer: audio_start ok (CONNECTING)");
             } else if (signal == LXST_STATUS_ESTABLISHED) {
+                diag_mark("answer: ESTABLISHED rx, pre audio_start");
                 s_state = CallState::ACTIVE;
                 s_start_ms = millis();
                 post_state_event();
                 if (!s_capture) {
-                    int mode = profile_to_codec2_mode(s_preferred_profile);
+                    int mode = profile_to_codec2_mode(effective_profile());  // §6
                     if (mode < 0) mode = CODEC2_MODE_700C;
                     if (!audio_start(mode)) { call_ended(); return; }
                 }
+                diag_mark("answer: ACTIVE entered");
             } else if (signal == LXST_STATUS_REJECTED) call_ended();
             break;
         case CallState::CONNECTING:
@@ -611,10 +685,16 @@ void pyxis_call_update() {
             s_state = CallState::CONNECTING;
             post_state_event();
             call_send_signal(LXST_STATUS_CONNECTING);
-            int mode = profile_to_codec2_mode(s_preferred_profile);
+            // §6: the caller's RINGING-time profile announce precedes
+            // the human answering, so s_remote_profile is populated
+            // here (if adoptable). Init the codec from the converged
+            // profile and announce that same value — not a restatement
+            // of our own preference.
+            int eff = effective_profile();
+            int mode = profile_to_codec2_mode(eff);
             if (mode < 0) mode = CODEC2_MODE_700C;
             if (!audio_start(mode)) { call_ended(); return; }
-            call_send_signal(LXST_PREFERRED_PROFILE + s_preferred_profile);
+            call_send_signal(LXST_PREFERRED_PROFILE + eff);
             call_send_signal(LXST_STATUS_ESTABLISHED);
             s_state = CallState::ACTIVE;
             s_start_ms = millis();
@@ -643,8 +723,10 @@ void pyxis_call_update() {
             size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
             size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
             if (free_heap < 14000 || largest < 6000) {
-                Serial.printf("[call] insufficient heap (free=%u largest=%u), aborting\n",
-                              (unsigned)free_heap, (unsigned)largest);
+                Serial.printf("[call] insufficient heap (free=%u largest=%u dma=%u/%u), aborting\n",
+                              (unsigned)free_heap, (unsigned)largest,
+                              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
             } else {
                 Bytes peer;
                 const char* hex = s_initiate_hex;

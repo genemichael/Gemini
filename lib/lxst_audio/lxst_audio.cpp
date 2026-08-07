@@ -148,6 +148,7 @@ bool LXSTAudio::init(int codec2Mode, uint8_t micGain) {
     // Create playback engine with its own codec instance
     playback_ = new I2SPlayback();
     if (!playback_->configureDecoder(decodeCodec_)) {
+        Serial.println("[AUDIO] Playback decoder config FAILED");
         ESP_LOGE(TAG, "Playback decoder config failed");
         delete capture_;
         capture_ = nullptr;
@@ -215,6 +216,10 @@ bool LXSTAudio::startCapture() {
     if (state_ == State::CAPTURING || state_ == State::FULL_DUPLEX) return true;
 
     if (!capture_->start()) {
+        // Serial in addition to ESP_LOGE: call-time start failures must
+        // be visible at the production CORE_DEBUG_LEVEL=0 (wadamesh
+        // lesson, docs/hybrid/WADAMESH_BACKPORT_BRIEF.md §3).
+        Serial.println("[AUDIO] Capture start FAILED");
         ESP_LOGE(TAG, "Failed to start capture");
         return false;
     }
@@ -257,6 +262,7 @@ bool LXSTAudio::startPlayback() {
     Notification::tone_deinit();
 
     if (!playback_->start()) {
+        Serial.println("[AUDIO] Playback start FAILED");
         ESP_LOGE(TAG, "Failed to start playback");
         return false;
     }
@@ -301,6 +307,7 @@ bool LXSTAudio::startFullDuplex() {
     if (!playback_->isPlaying()) {
         ESP_LOGI(TAG, "Starting playback (heap=%lu)...", (unsigned long)esp_get_free_heap_size());
         if (!playback_->start()) {
+            Serial.println("[AUDIO] Playback start FAILED (full-duplex)");
             ESP_LOGE(TAG, "Failed to start playback for full-duplex");
             return false;
         }
@@ -311,6 +318,7 @@ bool LXSTAudio::startFullDuplex() {
     if (!capture_->isCapturing()) {
         ESP_LOGI(TAG, "Starting capture (heap=%lu)...", (unsigned long)esp_get_free_heap_size());
         if (!capture_->start()) {
+            Serial.println("[AUDIO] Capture start FAILED (full-duplex)");
             ESP_LOGE(TAG, "Failed to start capture for full-duplex");
             playback_->stop();
             playback_->configureDecoder(decodeCodec_);

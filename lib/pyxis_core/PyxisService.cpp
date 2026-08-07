@@ -19,6 +19,8 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <time.h>
+#include <atomic>
+#include <esp_heap_caps.h>
 
 #include <microReticulum/Reticulum.h>
 #include <microReticulum/Utilities/OS.h>
@@ -113,14 +115,44 @@ static char s_tcp_host_c[64] = {0};
 
 // Cross-task command marshalling (see file header).
 struct SvcCmd {
-    enum Op : uint8_t { SEND, ANNOUNCE, SET_NAME, SET_TCP } op;
+    enum Op : uint8_t { SEND, ANNOUNCE, SET_NAME, SET_TCP,
+                        LIST_CONVS, READ_THREAD, MARK_READ } op;
     char dest_hex[33];
-    const char* text;            // caller-owned; caller blocks until done
+    const char* text;            // copied into the heap block's tail by run_cmd
     char out_hash[33];
     uint16_t port;               // SET_TCP
     bool flag;                   // SET_TCP: enabled
+    // Conversation snapshots (LIST_CONVS/READ_THREAD; commissioned by
+    // Gene 2026-08-07, TESTLOG "Live-bench session" UI findings; op
+    // shape from wadamesh PyxisService.cpp). `dest` is the CALLER'S
+    // out-array and is written ONLY by run_cmd on the DONE path: the
+    // service fills the heap block's tail (run_cmd sizes it) and never
+    // dereferences `dest`. Deliberate hardening over the wadamesh
+    // reference, which writes through caller pointers DURING execution
+    // — under the abandon handshake below those buffers may be dead by
+    // then. Same discipline as the `text` tail, in reverse. Ops with an
+    // output tail carry no text (both live at (cmd + 1)).
+    void* dest;                  // caller out-array; run_cmd-only
+    int   max_rows;              // capacity of the output tail, in rows
+    int   rows;                  // result: rows written
+    char  name_buf[48];          // READ_THREAD result: peer display name
     bool ok;
     SemaphoreHandle_t done;
+    // Ownership handshake — backport from wadamesh PyxisService.cpp per
+    // docs/hybrid/WADAMESH_BACKPORT_BRIEF.md §1 (field-proven
+    // 2026-07-31): run_cmd's old stack-resident command died when its
+    // 2s wait timed out while the service was FS-stalled — the service
+    // then executed the stale pointer and Gave a dead semaphore
+    // (xQueueGenericSend assert queue.c:821). Commands are now
+    // HEAP-owned with an atomic state; exactly one side frees:
+    //   PENDING -> DONE      (service won: it Gives, caller frees)
+    //   PENDING -> ABANDONED (caller timed out: service frees, no Give)
+    // Deliberate hardening over the wadamesh reference (which still has
+    // a dangling-text window): run_cmd copies `text` into the block's
+    // tail so an abandoning caller can't free it out from under do_send.
+    enum : uint8_t { CMD_PENDING = 0, CMD_DONE = 1, CMD_ABANDONED = 2 };
+    std::atomic<uint8_t> state{CMD_PENDING};
+    StaticSemaphore_t sem_buf;
 };
 static QueueHandle_t s_cmd_q = nullptr;
 
@@ -771,6 +803,35 @@ static void handle_test_command(const String& line) {
         } else {
             Serial.println("T:ERR name failed");
         }
+    } else if (cmd == "T:CONVS") {
+        // Read-only persisted-conversation dump (commissioned by Gene
+        // 2026-08-07 — reboot-survival check for the message store).
+        // Runs on the svc task, so direct store reads are legal here;
+        // same count= header + per-row line protocol as T:PATHS/T:RX.
+        if (!s_store) { Serial.println("T:ERR no store"); return; }
+        auto convs = s_store->get_conversations();
+        Serial.print("T:OK count=");
+        Serial.println(String((unsigned)convs.size()));
+        for (auto& p : convs) {
+            auto ci = s_store->get_conversation_info(p);
+            char snip[64] = {0};
+            if (ci.message_count > 0) {
+                auto md = s_store->load_message_metadata(
+                    ci.last_message_hash_bytes());
+                if (md.valid) strlcpy(snip, md.content.c_str(), sizeof(snip));
+            }
+            // Keep the line protocol intact: message content may hold
+            // newlines/controls — flatten them.
+            for (char* c = snip; *c; ++c)
+                if (*c < 0x20 || *c > 0x7e) *c = '.';
+            String r = "T:CONV ";
+            r += p.toHex().c_str();
+            r += " n=" + String((unsigned)ci.message_count);
+            r += " unread=" + String((unsigned)ci.unread_count);
+            r += " name="; r += ci.display_name;
+            r += " last="; r += snip;
+            Serial.println(r);
+        }
     } else if (cmd == "VERSION") {
         Serial.println("T:OK hybrid-phone M2");
     } else {
@@ -856,8 +917,77 @@ static void svc_execute_cmd(SvcCmd* cmd) {
         case SvcCmd::SET_TCP:
             cmd->ok = do_set_tcp(cmd->flag, cmd->text, cmd->port);
             break;
+        case SvcCmd::LIST_CONVS: {
+            // All Bytes/vector allocation stays HERE, on the pool's
+            // single legal thread; the caller gets plain structs.
+            // Rows go into the heap block's OUTPUT TAIL at (cmd + 1),
+            // never through cmd->dest (see the SvcCmd::dest comment).
+            cmd->rows = 0;
+            cmd->ok = (s_store && cmd->max_rows > 0);
+            if (!cmd->ok) break;
+            auto* rows = (PyxisConvRow*)(cmd + 1);
+            auto convs = s_store->get_conversations();   // newest first
+            for (auto& p : convs) {
+                if (cmd->rows >= cmd->max_rows) break;
+                // ~8.3KB ConversationInfo by-value temporary on this
+                // task's 16KB stack — sequential with loop steps, never
+                // concurrent. Re-check svc_hwm in T:STATE after first
+                // on-device use (wadamesh ran this on a 24KB stack).
+                auto ci = s_store->get_conversation_info(p);
+                PyxisConvRow& r = rows[cmd->rows++];
+                strlcpy(r.peer_hex, p.toHex().c_str(), sizeof(r.peer_hex));
+                strlcpy(r.name, ci.display_name, sizeof(r.name));
+                r.unread = (uint16_t)ci.unread_count;
+                r.msg_count = (uint16_t)ci.message_count;
+                r.last_ts = (uint32_t)ci.last_activity;
+                r.last_text[0] = 0;
+                if (ci.message_count > 0) {
+                    auto md = s_store->load_message_metadata(
+                        ci.last_message_hash_bytes());
+                    if (md.valid) {
+                        strlcpy(r.last_text, md.content.c_str(),
+                                sizeof(r.last_text));
+                        if (md.timestamp > 0) r.last_ts = (uint32_t)md.timestamp;
+                    }
+                }
+            }
+            break;
+        }
+        case SvcCmd::READ_THREAD: {
+            cmd->rows = 0;
+            cmd->name_buf[0] = 0;
+            RNS::Bytes peer;
+            cmd->ok = (s_store && cmd->max_rows > 0 &&
+                       parse_hex16(cmd->dest_hex, peer));
+            if (!cmd->ok) break;
+            auto* rows = (PyxisMsgRow*)(cmd + 1);
+            auto ci = s_store->get_conversation_info(peer);
+            strlcpy(cmd->name_buf, ci.display_name, sizeof(cmd->name_buf));
+            size_t first = ci.message_count > (size_t)cmd->max_rows
+                               ? ci.message_count - cmd->max_rows : 0;
+            for (size_t i = first; i < ci.message_count &&
+                                   cmd->rows < cmd->max_rows; ++i) {
+                auto md = s_store->load_message_metadata(ci.message_hash_bytes(i));
+                if (!md.valid) continue;
+                PyxisMsgRow& r = rows[cmd->rows++];
+                strlcpy(r.text, md.content.c_str(), sizeof(r.text));
+                r.ts = (uint32_t)md.timestamp;
+                r.incoming = md.incoming ? 1 : 0;
+                r.state = (uint8_t)md.state;
+            }
+            break;
+        }
+        case SvcCmd::MARK_READ: {
+            // Store writes stay on this task (UI opens a thread ->
+            // unread count clears).
+            RNS::Bytes peer;
+            cmd->ok = (s_store && parse_hex16(cmd->dest_hex, peer));
+            if (cmd->ok) s_store->mark_conversation_read(peer);
+            break;
+        }
     }
-    xSemaphoreGive(cmd->done);
+    // Completion signalling + freeing is the drain loop's job (ownership
+    // handshake) — nothing more here.
 }
 
 static void svc_task_body(void*) {
@@ -867,6 +997,10 @@ static void svc_task_body(void*) {
         return;
     }
     s_running = true;
+    // DIAGNOSTIC (2026-08-07 crash hunt): reset reason distinguishes
+    // panic / task-WDT / int-WDT / brownout even when the USB console
+    // dies before the backtrace can flush.
+    Serial.printf("[pyxis] reset_reason=%d\n", (int)esp_reset_reason());
     Serial.printf("[pyxis] service up  id=%s  dest=%s\n",
                   s_identity_hex, s_dest_hex);
 
@@ -947,10 +1081,22 @@ static void svc_task_body(void*) {
             }
         }
 
-        // -- Cross-task commands.
+        // -- Cross-task commands (heap-owned; see SvcCmd ownership note).
         SvcCmd* cmd = nullptr;
-        while (s_cmd_q && xQueueReceive(s_cmd_q, &cmd, 0) == pdTRUE)
+        while (s_cmd_q && xQueueReceive(s_cmd_q, &cmd, 0) == pdTRUE) {
+            if (cmd->state.load(std::memory_order_acquire) == SvcCmd::CMD_ABANDONED) {
+                heap_caps_free(cmd);   // caller gave up while we were busy
+                continue;
+            }
             svc_execute_cmd(cmd);
+            uint8_t expect = SvcCmd::CMD_PENDING;
+            if (cmd->state.compare_exchange_strong(expect, SvcCmd::CMD_DONE,
+                                                   std::memory_order_acq_rel)) {
+                xSemaphoreGive(cmd->done);   // caller still waiting; it frees
+            } else {
+                heap_caps_free(cmd);         // abandoned mid-execution
+            }
+        }
 
 #ifdef HYBRID_TEST_HOOKS
         test_hook_serial_pump();
@@ -981,7 +1127,12 @@ bool pyxis_service_start() {
     // neither fail nor fragment. Re-check svc_hwm in T:STATE after the
     // first long call before trimming further.
     static StaticTask_t s_svc_tcb;
-    static StackType_t  s_svc_stack[16384 / sizeof(StackType_t)];
+    // 16K→24K (backport 2026-08-07, wadamesh M3 on-device measurement:
+    // the call path needs ~17-20K — codec2 3200 decode runs on THIS task
+    // at the bottom of the RNS inbound chain; 16K blew the stack
+    // watchpoint in lpc_post_filter the moment the first audio frame
+    // arrived. Backtrace in TESTLOG "Live-bench session 2026-08-07".)
+    static StackType_t  s_svc_stack[24576 / sizeof(StackType_t)];
     s_task = xTaskCreateStaticPinnedToCore(
         svc_task_body, "pyxis_svc",
         sizeof(s_svc_stack) / sizeof(StackType_t), nullptr,
@@ -1005,16 +1156,54 @@ bool pyxis_get_delivery_dest(char out_hex[33]) {
     return true;
 }
 
-// Marshal a command onto the service task and wait (bounded) for it.
-static bool run_cmd(SvcCmd& cmd) {
+// Marshal a command onto the service task. The caller's SvcCmd is a
+// TEMPLATE: it is copied into a heap-owned block whose lifetime the
+// ownership handshake governs; results copy back only on completion.
+// out_bytes > 0 appends an OUTPUT TAIL to the block (LIST_CONVS/
+// READ_THREAD row arrays): the service fills the tail, and the caller's
+// tmpl.dest buffer is written only HERE on the DONE path — an abandoned
+// command's tail dies with the block, never with the caller's stack.
+// (Ops with an output tail carry no text; both live at (cmd + 1).)
+static bool run_cmd(SvcCmd& tmpl, size_t out_bytes = 0) {
     if (!s_running || !s_cmd_q) return false;
-    StaticSemaphore_t sem_buf;
-    cmd.done = xSemaphoreCreateBinaryStatic(&sem_buf);
-    SvcCmd* p = &cmd;
-    if (xQueueSend(s_cmd_q, &p, pdMS_TO_TICKS(100)) != pdTRUE) return false;
-    // Generous bound: send path can hit path-request work.
-    if (xSemaphoreTake(cmd.done, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
-    return cmd.ok;
+    size_t text_len = tmpl.text ? strlen(tmpl.text) + 1 : 0;
+    SvcCmd* cmd = (SvcCmd*)heap_caps_malloc(sizeof(SvcCmd) + text_len + out_bytes,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!cmd) return false;
+    memcpy((void*)cmd, (const void*)&tmpl, sizeof(SvcCmd));
+    if (text_len) {
+        char* t = (char*)(cmd + 1);
+        memcpy(t, tmpl.text, text_len);
+        cmd->text = t;
+    }
+    if (out_bytes) memset((void*)(cmd + 1), 0, out_bytes);
+    cmd->state.store(SvcCmd::CMD_PENDING, std::memory_order_relaxed);
+    cmd->done = xSemaphoreCreateBinaryStatic(&cmd->sem_buf);
+    SvcCmd* p = cmd;
+    if (xQueueSend(s_cmd_q, &p, pdMS_TO_TICKS(100)) != pdTRUE) {
+        heap_caps_free(cmd);
+        return false;
+    }
+    // 3500ms: FS-stall windows can exceed the old 2000ms — but
+    // correctness no longer depends on the bound; a timeout now
+    // abandons safely instead of leaving a live pointer to a dead stack.
+    if (xSemaphoreTake(cmd->done, pdMS_TO_TICKS(3500)) != pdTRUE) {
+        uint8_t expect = SvcCmd::CMD_PENDING;
+        if (cmd->state.compare_exchange_strong(expect, SvcCmd::CMD_ABANDONED,
+                                               std::memory_order_acq_rel)) {
+            return false;   // service will free it when it drains/finishes
+        }
+        // Service completed in the race window — the Give is in flight.
+        xSemaphoreTake(cmd->done, portMAX_DELAY);
+    }
+    memcpy((void*)&tmpl, (const void*)cmd, sizeof(SvcCmd));   // results back
+    // DONE path only: the service finished and Gave — the block's
+    // output tail is complete and quiescent, and the caller's buffer
+    // is alive (we're on its stack frame). Copy out now, never earlier.
+    if (out_bytes && tmpl.dest && tmpl.ok)
+        memcpy(tmpl.dest, (const void*)(cmd + 1), out_bytes);
+    heap_caps_free(cmd);
+    return tmpl.ok;
 }
 
 bool pyxis_send_lxmf(const char* dest_hex, const char* text,
@@ -1083,6 +1272,45 @@ bool pyxis_get_tcp(bool* enabled, char host_out[64], uint16_t* port,
     if (port) *port = s_cfg.tcp_port;
     if (online) *online = (s_tcp_if && s_tcp_if->online());
     return true;
+}
+
+// ---- persisted-conversation snapshots (see PyxisService.h block
+// comment for provenance + the RNS-types-stay-on-svc-task hard rule).
+// max_rows clamps also bound the PSRAM output-tail allocation.
+int pyxis_list_conversations(PyxisConvRow* out, int max_rows) {
+    if (!out || max_rows <= 0) return 0;
+    if (max_rows > (int)LXMF::MAX_CONVERSATIONS)
+        max_rows = (int)LXMF::MAX_CONVERSATIONS;
+    SvcCmd cmd = {};
+    cmd.op = SvcCmd::LIST_CONVS;
+    cmd.dest = out;
+    cmd.max_rows = max_rows;
+    if (!run_cmd(cmd, (size_t)max_rows * sizeof(PyxisConvRow))) return 0;
+    return cmd.rows;
+}
+
+int pyxis_read_thread(const char* peer_hex, PyxisMsgRow* out, int max_rows,
+                      char name_out[48]) {
+    if (!peer_hex || strlen(peer_hex) != 32 || !out || max_rows <= 0)
+        return -1;
+    if (max_rows > (int)LXMF::MAX_MESSAGES_PER_CONVERSATION)
+        max_rows = (int)LXMF::MAX_MESSAGES_PER_CONVERSATION;
+    SvcCmd cmd = {};
+    cmd.op = SvcCmd::READ_THREAD;
+    cmd.dest = out;
+    cmd.max_rows = max_rows;
+    strlcpy(cmd.dest_hex, peer_hex, sizeof(cmd.dest_hex));
+    if (!run_cmd(cmd, (size_t)max_rows * sizeof(PyxisMsgRow))) return -1;
+    if (name_out) strlcpy(name_out, cmd.name_buf, 48);
+    return cmd.rows;
+}
+
+bool pyxis_mark_read(const char* peer_hex) {
+    if (!peer_hex || strlen(peer_hex) != 32) return false;
+    SvcCmd cmd = {};
+    cmd.op = SvcCmd::MARK_READ;
+    strlcpy(cmd.dest_hex, peer_hex, sizeof(cmd.dest_hex));
+    return run_cmd(cmd);
 }
 
 #ifdef HYBRID_TEST_HOOKS

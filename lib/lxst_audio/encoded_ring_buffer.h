@@ -27,6 +27,9 @@ public:
     int availableSlots() const;
     void reset();
 
+    /** False if the backing allocation failed — write()/read() no-op then. */
+    bool isValid() const { return buffer_ != nullptr; }
+
 private:
     const int maxSlots_;
     const int maxBytesPerSlot_;

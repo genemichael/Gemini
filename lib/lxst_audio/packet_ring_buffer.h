@@ -30,6 +30,9 @@ public:
     int frameSamples() const { return frameSamples_; }
     void reset();
 
+    /** False if the backing allocation failed — write()/read() no-op then. */
+    bool isValid() const { return buffer_ != nullptr; }
+
 private:
     const int maxFrames_;
     const int frameSamples_;

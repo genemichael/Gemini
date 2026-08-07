@@ -16,6 +16,12 @@ using namespace Hardware::TDeck;
 
 static const char* TAG = "LXST:Playback";
 
+// Serial passthrough (lib/pyxis_core/PyxisCall.cpp) — critical failure
+// paths log through this in addition to ESP_LOGE, which is compiled out
+// at the production CORE_DEBUG_LEVEL=0 (wadamesh lesson,
+// docs/hybrid/WADAMESH_BACKPORT_BRIEF.md §3).
+extern "C" void pyxis_log(const char* msg);
+
 I2SPlayback::I2SPlayback() = default;
 
 I2SPlayback::~I2SPlayback() {
@@ -27,6 +33,7 @@ bool I2SPlayback::configureDecoder(Codec2Wrapper* codec) {
     releaseBuffers();
 
     if (!codec || !codec->isCreated()) {
+        pyxis_log("[PLAY] configureDecoder FAILED: invalid codec pointer");
         ESP_LOGE(TAG, "Invalid codec pointer");
         return false;
     }
@@ -45,6 +52,17 @@ bool I2SPlayback::configureDecoder(Codec2Wrapper* codec) {
     // Drop buffer (for ring overflow discard)
     dropBuf_ = static_cast<int16_t*>(
         heap_caps_malloc(sizeof(int16_t) * frameSamples_, MALLOC_CAP_SPIRAM));
+
+    // PSRAM allocation failures were previously unchecked: a null
+    // decodeBuf_ makes writeEncodedPacket() return false forever (dead
+    // RX audio with no log); a null ring silently drops every frame.
+    // Fail loudly and cleanly instead.
+    if (!pcmRing_ || !pcmRing_->isValid() || !decodeBuf_ || !dropBuf_) {
+        pyxis_log("[PLAY] configureDecoder FAILED: PSRAM alloc (ring/decode/drop)");
+        ESP_LOGE(TAG, "configureDecoder: PSRAM allocation failed");
+        releaseBuffers();
+        return false;
+    }
 
     ESP_LOGI(TAG, "Decoder configured: Codec2 mode %d, %d samples/frame",
              codec_->libraryMode(), frameSamples_);
@@ -74,6 +92,9 @@ bool I2SPlayback::start() {
 
     esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
+        char logbuf[64];
+        snprintf(logbuf, sizeof(logbuf), "[PLAY] I2S_NUM_0 driver install FAILED: %d", (int)err);
+        pyxis_log(logbuf);
         ESP_LOGE(TAG, "I2S_NUM_0 driver install failed: %d", err);
         return false;
     }
@@ -87,6 +108,9 @@ bool I2SPlayback::start() {
 
     err = i2s_set_pin(I2S_NUM_0, &pin_config);
     if (err != ESP_OK) {
+        char logbuf[64];
+        snprintf(logbuf, sizeof(logbuf), "[PLAY] I2S_NUM_0 pin config FAILED: %d", (int)err);
+        pyxis_log(logbuf);
         ESP_LOGE(TAG, "I2S_NUM_0 pin config failed: %d", err);
         i2s_driver_uninstall(I2S_NUM_0);
         return false;
@@ -105,6 +129,10 @@ bool I2SPlayback::start() {
         PLAYBACK_TASK_CORE);
 
     if (ret != pdPASS) {
+        // This exact failure (dynamic stack alloc at call time) cost
+        // wadamesh two debugging rounds — ESP_LOGE alone is invisible
+        // at CORE_DEBUG_LEVEL=0.
+        pyxis_log("[PLAY] playback task create FAILED");
         ESP_LOGE(TAG, "Failed to create playback task");
         playing_.store(false, std::memory_order_relaxed);
         i2s_driver_uninstall(I2S_NUM_0);
@@ -213,14 +241,22 @@ void I2SPlayback::playbackLoop() {
     // Frame buffer for reading from ring
     int16_t* frameBuf = static_cast<int16_t*>(
         heap_caps_malloc(sizeof(int16_t) * frameSamples_, MALLOC_CAP_SPIRAM));
-    if (!frameBuf) {
-        ESP_LOGE(TAG, "Failed to allocate frame buffer");
-        return;
-    }
 
     // Silence frame for underruns
     int16_t* silenceFrame = static_cast<int16_t*>(
         heap_caps_calloc(frameSamples_, sizeof(int16_t), MALLOC_CAP_SPIRAM));
+
+    // Either alloc failing means the task exits immediately — playback
+    // looks "started" to the caller but produces no audio, so say so on
+    // production serial. (silenceFrame was previously unchecked and is
+    // handed straight to i2s_write on the first underrun.)
+    if (!frameBuf || !silenceFrame) {
+        pyxis_log("[PLAY] playback task FAILED: PSRAM frame/silence alloc — no RX audio");
+        ESP_LOGE(TAG, "Failed to allocate frame buffer");
+        free(frameBuf);
+        free(silenceFrame);
+        return;
+    }
 
     uint32_t framesPlayed = 0;
 

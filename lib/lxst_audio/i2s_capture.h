@@ -113,6 +113,7 @@ private:
     std::atomic<bool> capturing_{false};
     std::atomic<bool> muted_{false};
     void* taskHandle_ = nullptr;
+    std::atomic<bool> taskExited_{false};   // set by the task at exit; stop() joins on it
 
     // Test injection (see setInjectSine). When injectSine_ is true,
     // the capture path replaces accumulated mic samples with a

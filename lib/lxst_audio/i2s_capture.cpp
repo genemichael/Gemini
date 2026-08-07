@@ -64,6 +64,12 @@ bool I2SCapture::init() {
 
     esp_err_t err = i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
+        // pyxis_log in addition to ESP_LOGE: critical failure paths must
+        // be visible on production serial (CORE_DEBUG_LEVEL=0 compiles
+        // ESP_LOGE out — wadamesh lesson, WADAMESH_BACKPORT_BRIEF.md §3).
+        char logbuf[64];
+        snprintf(logbuf, sizeof(logbuf), "[CAP] I2S_NUM_1 driver install FAILED: %d", (int)err);
+        pyxis_log(logbuf);
         ESP_LOGE(TAG, "I2S_NUM_1 driver install failed: %d", err);
         return false;
     }
@@ -77,6 +83,9 @@ bool I2SCapture::init() {
 
     err = i2s_set_pin(I2S_NUM_1, &pin_config);
     if (err != ESP_OK) {
+        char logbuf[64];
+        snprintf(logbuf, sizeof(logbuf), "[CAP] I2S_NUM_1 pin config FAILED: %d", (int)err);
+        pyxis_log(logbuf);
         ESP_LOGE(TAG, "I2S_NUM_1 pin config failed: %d", err);
         i2s_driver_uninstall(I2S_NUM_1);
         return false;
@@ -94,6 +103,7 @@ bool I2SCapture::configureEncoder(Codec2Wrapper* codec, bool enableFilters) {
     releaseBuffers();
 
     if (!codec || !codec->isCreated()) {
+        pyxis_log("[CAP] configureEncoder FAILED: invalid codec pointer");
         ESP_LOGE(TAG, "Invalid codec pointer");
         return false;
     }
@@ -117,6 +127,17 @@ bool I2SCapture::configureEncoder(Codec2Wrapper* codec, bool enableFilters) {
     // Silence buffer for mute
     silenceBuf_ = static_cast<int16_t*>(
         heap_caps_calloc(frameSamples_, sizeof(int16_t), MALLOC_CAP_SPIRAM));
+
+    // PSRAM allocation failures were previously unchecked: a null
+    // accumBuffer_ is a guaranteed memcpy-to-NULL crash in the capture
+    // loop, and a null ring silently drops every encoded packet (dead
+    // TX audio with no log). Fail loudly and cleanly instead.
+    if (!encodedRing_ || !encodedRing_->isValid() || !accumBuffer_ || !silenceBuf_) {
+        pyxis_log("[CAP] configureEncoder FAILED: PSRAM alloc (ring/accum/silence)");
+        ESP_LOGE(TAG, "configureEncoder: PSRAM allocation failed");
+        releaseBuffers();
+        return false;
+    }
 
     // Filter chain: 1 channel (mono), voice band 300-3400Hz, AGC -12dB target, 12dB max gain
     // PGA gain is 21dB; loud speech peaks around -6dBFS, quiet around -20dBFS.
@@ -155,6 +176,9 @@ bool I2SCapture::start() {
     taskHandle_ = h;
 
     if (h == nullptr) {
+        // Call-time task-create failure cost wadamesh two debugging
+        // rounds because ESP_LOGE is invisible at CORE_DEBUG_LEVEL=0.
+        pyxis_log("[CAP] capture task create FAILED (static)");
         ESP_LOGE(TAG, "Failed to create capture task");
         capturing_.store(false, std::memory_order_relaxed);
         return false;
@@ -169,9 +193,24 @@ void I2SCapture::stop() {
 
     capturing_.store(false, std::memory_order_relaxed);
 
-    // Wait for task to exit
+    // REAL join, backported from wadamesh (docs/hybrid/WADAMESH_BACKPORT_BRIEF.md §3):
+    // the old fixed 50ms wait returned while the task could still be
+    // mid-encode — the caller then freed the codec under it
+    // (LoadStoreError on device). Poll the task's exit flag; a
+    // capture-loop iteration is bounded by the I2S read timeout + one
+    // encode, so 1.5s covers it with a loud complaint if it somehow
+    // doesn't.
     if (taskHandle_) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+        for (int i = 0; i < 150 && !taskExited_.load(std::memory_order_acquire); ++i)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        if (!taskExited_.load(std::memory_order_acquire)) {
+            // Serial passthrough — ESP_LOGE alone is invisible under
+            // CORE_DEBUG_LEVEL=0, and proceeding here means the codec
+            // may be freed under a live encoder.
+            pyxis_log("[CAP] ERROR: capture task did not exit in 1.5s — teardown proceeding UNSAFELY");
+            ESP_LOGE(TAG, "capture task did not exit in 1.5s");
+        }
+        taskExited_.store(false, std::memory_order_relaxed);   // re-arm for next start()
         taskHandle_ = nullptr;
     }
 
@@ -204,6 +243,7 @@ void I2SCapture::releaseBuffers() {
 void I2SCapture::captureTask(void* param) {
     auto* self = static_cast<I2SCapture*>(param);
     self->captureLoop();
+    self->taskExited_.store(true, std::memory_order_release);   // join flag for stop()
     vTaskDelete(NULL);
 }
 
