@@ -67,7 +67,7 @@ def merge_bin(source, target, env):
     releases_dir = os.path.join(project_dir, RELEASES_DIR_NAME)
     os.makedirs(releases_dir, exist_ok=True)
 
-    output      = os.path.join(releases_dir, "meshpunk-%s-merged.bin" % version)
+    output      = os.path.join(releases_dir, "mesh-gemini-%s-merged.bin" % version)
 
     bins = {
         "bootloader": os.path.join(build_dir, "bootloader.bin"),
@@ -113,7 +113,7 @@ def merge_bin(source, target, env):
     subprocess.check_call(cmd)
 
     # Full filesystem image (the build's littlefs, for flashing the FS alone).
-    littlefs_out = os.path.join(releases_dir, "meshpunk-%s-littlefs.bin" % version)
+    littlefs_out = os.path.join(releases_dir, "mesh-gemini-%s-littlefs.bin" % version)
     shutil.copy2(bins["littlefs"], littlefs_out)
     print("merge_bin: copied full littlefs image to %s" % littlefs_out)
 
@@ -130,7 +130,7 @@ def merge_bin(source, target, env):
     # Self-contained app binary: THE universal file. Flash at the app offset
     # (0x10000) via any flasher, or install through the Launcher; it populates
     # its own filesystem on first boot.
-    firmware_out = os.path.join(releases_dir, "meshpunk-%s-firmware.bin" % version)
+    firmware_out = os.path.join(releases_dir, "mesh-gemini-%s-firmware.bin" % version)
     shutil.copy2(bins["firmware"], firmware_out)
     print("merge_bin: copied firmware (app) binary to %s" % firmware_out)
 
@@ -149,7 +149,7 @@ def merge_bin(source, target, env):
     with open(launcher_table, "wb") as f:
         f.write(build_launcher_partition_table(fs_size))
 
-    launcher_img = os.path.join(releases_dir, "meshpunk-%s-launcher.bin" % version)
+    launcher_img = os.path.join(releases_dir, "mesh-gemini-%s-launcher.bin" % version)
     launcher_cmd = [
         sys.executable, esptool,
         "--chip", "esp32s3",
