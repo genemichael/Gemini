@@ -1,7 +1,7 @@
 {
     "name": "lxst_audio",
     "version": "0.1.0",
-    "description": "LXST voice capture/codec path vendored from pyxis (GPL-3.0). Hybrid build uses I2SCapture + Codec2Wrapper + filters + ring buffers only; lxst_audio.cpp (full-duplex orchestrator, depends on pyxis's Tone) and i2s_playback.cpp (would fight meshpunk's boot-installed I2S_NUM_0 driver — HYBRID_PLAN D4) are excluded from the build. Pins come from the local Hardware/TDeck/Config.h shim.",
+    "description": "LXST voice capture/codec path vendored from pyxis (GPL-3.0). Hybrid build uses I2SCapture + Codec2Wrapper + filters + ring buffers + I2SPlayback. lxst_audio.cpp (full-duplex orchestrator, depends on pyxis's Tone) stays excluded. i2s_playback.cpp was excluded under D4 (fought meshpunk's boot-installed I2S_NUM_0 driver); D12 (docs/hybrid/HYBRID_PLAN.md) supersedes that for call duration only — PyxisCall.cpp swaps I2S0 to this file's native-8k driver via sound.cpp's new acquire/restore API and swaps the mixer back at every call end. Pins come from the local Hardware/TDeck/Config.h shim.",
     "license": "GPL-3.0-or-later",
     "frameworks": "arduino",
     "platforms": "espressif32",
@@ -12,8 +12,7 @@
     "build": {
         "srcFilter": [
             "+<*>",
-            "-<lxst_audio.cpp>",
-            "-<i2s_playback.cpp>"
+            "-<lxst_audio.cpp>"
         ]
     }
 }

@@ -11,6 +11,11 @@
 //   _rns_announce()            -> bool
 //   _rns_get_name()            -> string ("" when unset)
 //   _rns_set_name(name)        -> bool (persists + re-announces)
+//   _rns_list_conversations(max) -> array of {peer=, name=, last=, ts=,
+//                                   unread=, count=}, newest-first
+//   _rns_read_thread(peer_hex, max) -> name, {msg rows} where each row is
+//                                   {text=, ts=, incoming=, state=}, oldest-first
+//   _rns_mark_read(peer_hex)   -> bool
 //
 // Native -> Lua: rns_bridge_dispatch() pushes one PyxisEvent into
 // lib/rns.lua's __dispatch_* functions, following punkmesh.cpp's
@@ -25,6 +30,7 @@
 
 #include <ctype.h>
 #include <string.h>
+#include <esp_heap_caps.h>
 
 extern "C" {
 #include <lua.h>
@@ -156,6 +162,115 @@ static int lua_rns_set_auto(lua_State* L) {
     return 1;
 }
 
+// _rns_list_conversations(max) -> array of {peer=, name=, last=, ts=,
+// unread=, count=}, newest-activity-first. max is clamped to [1,32] —
+// pyxis_list_conversations caps at 32 server-side (PyxisService.h:124);
+// never ask it for more. Out-array lives in PSRAM (bulky: 33+48+64+... per
+// row) and is freed on every return path before control returns to Lua.
+static int lua_rns_list_conversations(lua_State* L) {
+    int max = (int)luaL_optinteger(L, 1, 32);
+    if (max < 1) max = 1;
+    if (max > 32) max = 32;
+
+    PyxisConvRow* rows = (PyxisConvRow*)heap_caps_malloc(
+        sizeof(PyxisConvRow) * (size_t)max, MALLOC_CAP_SPIRAM);
+    if (!rows) {
+        lua_newtable(L);   // alloc failure -> empty roster, not a Lua error
+        return 1;
+    }
+
+    int n = pyxis_list_conversations(rows, max);
+    if (n < 0) n = 0;
+
+    lua_newtable(L);
+    for (int i = 0; i < n; i++) {
+        lua_newtable(L);
+        lua_pushstring(L, rows[i].peer_hex);
+        lua_setfield(L, -2, "peer");
+        lua_pushstring(L, rows[i].name);
+        lua_setfield(L, -2, "name");
+        lua_pushstring(L, rows[i].last_text);
+        lua_setfield(L, -2, "last");
+        lua_pushinteger(L, (lua_Integer)rows[i].last_ts);
+        lua_setfield(L, -2, "ts");
+        lua_pushinteger(L, rows[i].unread);
+        lua_setfield(L, -2, "unread");
+        lua_pushinteger(L, rows[i].msg_count);
+        lua_setfield(L, -2, "count");
+        lua_rawseti(L, -2, i + 1);
+    }
+
+    heap_caps_free(rows);
+    return 1;
+}
+
+// _rns_read_thread(peer_hex, max) -> name, {msg rows} | nil, err
+// Each row is {text=, ts=, incoming=, state=}, OLDEST-first (PyxisService.h
+// :130). max is clamped to [1,256] (the store's per-conversation cap) —
+// callers opening a thread must keep it far smaller (<=16, see W3): every
+// row is a file read on the svc task inside run_cmd's 3500ms window. -1
+// from the native call means failure (service down / bad peer), distinct
+// from a real empty thread (0 rows) — surfaced as nil, err. Out-array lives
+// in PSRAM and is freed on every return path.
+static int lua_rns_read_thread(lua_State* L) {
+    const char* peer_hex = luaL_checkstring(L, 1);
+    int max = (int)luaL_optinteger(L, 2, 16);
+    if (!is_hex32(peer_hex)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "peer must be 32 hex chars");
+        return 2;
+    }
+    if (max < 1) max = 1;
+    if (max > 256) max = 256;
+
+    PyxisMsgRow* rows = (PyxisMsgRow*)heap_caps_malloc(
+        sizeof(PyxisMsgRow) * (size_t)max, MALLOC_CAP_SPIRAM);
+    if (!rows) {
+        lua_pushnil(L);
+        lua_pushstring(L, "out of memory");
+        return 2;
+    }
+
+    char name_out[48] = {0};
+    int n = pyxis_read_thread(peer_hex, rows, max, name_out);
+    if (n < 0) {
+        heap_caps_free(rows);
+        lua_pushnil(L);
+        lua_pushstring(L, "read failed");
+        return 2;
+    }
+
+    lua_pushstring(L, name_out);
+
+    lua_newtable(L);
+    for (int i = 0; i < n; i++) {
+        lua_newtable(L);
+        lua_pushstring(L, rows[i].text);
+        lua_setfield(L, -2, "text");
+        lua_pushinteger(L, (lua_Integer)rows[i].ts);
+        lua_setfield(L, -2, "ts");
+        lua_pushboolean(L, rows[i].incoming ? 1 : 0);
+        lua_setfield(L, -2, "incoming");
+        lua_pushinteger(L, rows[i].state);
+        lua_setfield(L, -2, "state");
+        lua_rawseti(L, -2, i + 1);
+    }
+
+    heap_caps_free(rows);
+    return 2;
+}
+
+// _rns_mark_read(peer_hex) -> bool
+static int lua_rns_mark_read(lua_State* L) {
+    const char* peer_hex = luaL_checkstring(L, 1);
+    if (!is_hex32(peer_hex)) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    lua_pushboolean(L, pyxis_mark_read(peer_hex) ? 1 : 0);
+    return 1;
+}
+
 void rns_bridge_register(lua_State* L) {
     lua_register(L, "_rns_running",  lua_rns_running);
     lua_register(L, "_rns_identity", lua_rns_identity);
@@ -168,6 +283,9 @@ void rns_bridge_register(lua_State* L) {
     lua_register(L, "_rns_set_tcp",  lua_rns_set_tcp);
     lua_register(L, "_rns_get_auto", lua_rns_get_auto);
     lua_register(L, "_rns_set_auto", lua_rns_set_auto);
+    lua_register(L, "_rns_list_conversations", lua_rns_list_conversations);
+    lua_register(L, "_rns_read_thread",        lua_rns_read_thread);
+    lua_register(L, "_rns_mark_read",          lua_rns_mark_read);
 }
 
 // ── C++ -> Lua dispatch (one function per PyxisEvent kind) ─────────────────

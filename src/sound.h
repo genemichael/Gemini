@@ -89,6 +89,31 @@ void sound_register_lua(lua_State* L);
 void sound_suspend();
 void sound_resume();
 
+// ── I2S0 ownership handoff for call-duration native-8k playback (D12) ────────
+// HYBRID_PLAN.md D12: for the duration of a Pyxis voice call, PyxisCall.cpp
+// swaps I2S_NUM_0 from the mixer's boot-installed 44.1kHz driver to a
+// low-latency 8kHz mono driver fed directly by decoded Codec2 PCM (no
+// resample, no mixer) — this is what fixed the RX playback garble the
+// mixer's extern-PCM path produced. sound.cpp owns I2S0's canonical config
+// and lifecycle; PyxisCall.cpp never hardcodes the mixer's DMA geometry —
+// it calls these two entry points only.
+//
+// sound_i2s0_acquire_for_call(): suspends the mixer (parks sound_task,
+// stops file playback, i2s_stop) then uninstalls I2S0's mixer driver,
+// freeing its 16KB DMA for the call's ~1KB 8kHz driver. Call this
+// immediately before installing the call's own I2S0 driver.
+bool sound_i2s0_acquire_for_call();
+// sound_i2s0_restore_after_call(): reinstalls the mixer's byte-identical
+// boot config (kMixerCfg) and resumes the mixer. MUST be called at every
+// call end (the caller's audio_stop_and_free() funnel), guarded by its own
+// ownership flag so this is safe to call even when acquire was never
+// reached. Idempotent and retryable: on i2s_driver_install failure it logs
+// loudly, leaves the mixer down, and arms sound_task's self-heal retry (its
+// idle pass keeps retrying rather than staying dead until reboot) — the
+// caller should treat a false return as "not yet restored, will keep
+// trying" rather than a terminal failure.
+bool sound_i2s0_restore_after_call();
+
 // ── External audio (native ELF modules) ──────────────────────────────────────
 
 // Set the input sample rate for external audio. The mixer upsamples to

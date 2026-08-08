@@ -22,6 +22,16 @@ static const char* TAG = "LXST:Playback";
 // docs/hybrid/WADAMESH_BACKPORT_BRIEF.md §3).
 extern "C" void pyxis_log(const char* msg);
 
+// HYBRID (D12, ported from wadamesh — its WADAMESH_FORK_BUILD static-stack
+// path, i2s_playback.cpp:106-131 in ../wadamesh): the dynamic 8KB
+// xTaskCreatePinnedToCore stack was a call-time internal-heap allocation
+// D11 forbids ("8KB stack failed silently, largest block 7,668 < 8,192" on
+// device). meshpunk has no equivalent build flag to gate this behind, so
+// (per D12 §7) it is unconditional here — the stack itself lives in
+// PyxisCall.cpp's boot BSS (mirrors i2s_capture.cpp's s_cap_stack) and is
+// handed over through this accessor.
+extern "C" void* lxst_playback_get_stack();
+
 I2SPlayback::I2SPlayback() = default;
 
 I2SPlayback::~I2SPlayback() {
@@ -122,17 +132,31 @@ bool I2SPlayback::start() {
     if (pcmRing_) pcmRing_->reset();
 
     playing_.store(true, std::memory_order_relaxed);
+    taskExited_.store(false, std::memory_order_relaxed);   // re-armed for this run
 
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        playbackTask, "lxst_play", PLAYBACK_TASK_STACK, this,
-        PLAYBACK_TASK_PRIORITY, reinterpret_cast<TaskHandle_t*>(&taskHandle_),
-        PLAYBACK_TASK_CORE);
+    // HYBRID (D12): static stack, boot-reserved in PyxisCall.cpp's BSS —
+    // no call-time internal-heap allocation (D11). The TCB is a function-
+    // static here (one I2SPlayback instance ever exists, in PyxisCall.cpp)
+    // so it, too, costs nothing at call time.
+    static StaticTask_t s_play_tcb;
+    StackType_t* stack = (StackType_t*)lxst_playback_get_stack();
+    if (!stack) {
+        // Boot reservation missing/failed — this exact failure (dynamic
+        // stack alloc at call time) cost wadamesh two debugging rounds;
+        // ESP_LOGE alone is invisible at CORE_DEBUG_LEVEL=0.
+        pyxis_log("[PLAY] no playback stack (boot reservation missing)");
+        ESP_LOGE(TAG, "Failed to create playback task: no static stack");
+        playing_.store(false, std::memory_order_relaxed);
+        i2s_driver_uninstall(I2S_NUM_0);
+        i2sInitialized_ = false;
+        return false;
+    }
+    taskHandle_ = xTaskCreateStaticPinnedToCore(
+        playbackTask, "lxst_play", PLAYBACK_TASK_STACK / sizeof(StackType_t),
+        this, PLAYBACK_TASK_PRIORITY, stack, &s_play_tcb, PLAYBACK_TASK_CORE);
 
-    if (ret != pdPASS) {
-        // This exact failure (dynamic stack alloc at call time) cost
-        // wadamesh two debugging rounds — ESP_LOGE alone is invisible
-        // at CORE_DEBUG_LEVEL=0.
-        pyxis_log("[PLAY] playback task create FAILED");
+    if (taskHandle_ == nullptr) {
+        pyxis_log("[PLAY] playback task create FAILED (static)");
         ESP_LOGE(TAG, "Failed to create playback task");
         playing_.store(false, std::memory_order_relaxed);
         i2s_driver_uninstall(I2S_NUM_0);
@@ -149,8 +173,25 @@ void I2SPlayback::stop() {
 
     playing_.store(false, std::memory_order_relaxed);
 
+    // HYBRID (D12 hardening — wadamesh LACKS this, deliberate addition):
+    // the reference stop() did a blind vTaskDelay(50ms) then nulled
+    // taskHandle_ and uninstalled I2S0. If playbackLoop() was mid-i2s_write
+    // (100ms timeout, see below) it could still be running past 50ms —
+    // either we uninstall I2S0 under a live writer, or the task runs on
+    // after the caller has already reinstalled the mixer and writes into
+    // ITS driver. Doubly required here because the task stack is a single
+    // static BSS block reused across calls (start() must not hand it to a
+    // new task until this one is fully past its last I2S touch).
     if (taskHandle_) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+        uint32_t waited = 0;
+        while (!taskExited_.load(std::memory_order_acquire) && waited < 300) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            waited += 5;
+        }
+        if (!taskExited_.load(std::memory_order_acquire)) {
+            pyxis_log("[PLAY] ERROR: playback task did not exit in 300ms — teardown proceeding UNSAFELY");
+            ESP_LOGE(TAG, "playback task did not exit in 300ms");
+        }
         taskHandle_ = nullptr;
     }
 
@@ -229,6 +270,10 @@ int I2SPlayback::bufferedFrames() const {
 void I2SPlayback::playbackTask(void* param) {
     auto* self = static_cast<I2SPlayback*>(param);
     self->playbackLoop();
+    // D12: signal stop()'s join BEFORE deleting — the static stack this
+    // task runs on must not be handed to a new task until this store is
+    // visible and the task has actually left the scheduler.
+    self->taskExited_.store(true, std::memory_order_release);
     vTaskDelete(NULL);
 }
 

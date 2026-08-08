@@ -85,6 +85,47 @@ local function resolve_name(dest_hex, announce_name)
     return dest_hex:sub(1, 16)
 end
 
+-- Roster = persisted conversations (native store, req. 2: rows survive
+-- reboot even with no announce since boot) UNION live announces, keyed by
+-- dest hex. Conversation rows win (they carry unread/last-activity from the
+-- store); an announce for a peer already covered by a conversation only
+-- backfills last_seen if the conv row didn't have one. entry.name here is a
+-- FALLBACK candidate only (store or announce name) -- every render path
+-- still goes through resolve_name(dest, entry.name), never entry.name alone
+-- (P3_HANDOFF.md §1 nickname rule).
+local function merge_roster()
+    local order = {}
+    local by_dest = {}
+
+    local convs = rns:conversations(32)
+    for _, c in ipairs(convs) do
+        local entry = {
+            dest = c.peer, name = c.name, last_seen = c.ts,
+            unread = (c.unread or 0) > 0, is_conv = true,
+        }
+        by_dest[c.peer] = entry
+        table.insert(order, c.peer)
+    end
+
+    local anns = rns:announces()
+    for _, a in ipairs(anns) do
+        local e = by_dest[a.dest]
+        if e then
+            if (not e.last_seen or e.last_seen == 0) and a.last_seen and a.last_seen > 0 then
+                e.last_seen = a.last_seen
+            end
+            if (not e.name or e.name == "") and a.name and a.name ~= "" then
+                e.name = a.name
+            end
+        else
+            by_dest[a.dest] = { dest = a.dest, name = a.name, last_seen = a.last_seen, unread = false, is_conv = false }
+            table.insert(order, a.dest)
+        end
+    end
+
+    return order, by_dest
+end
+
 -- ── View teardown (mirrors Messenger's clear_view: drop the nav stack, then
 -- chunk-delete the outgoing body so a big list doesn't trip the watchdog). ──
 local function clear_view()
@@ -144,22 +185,25 @@ show_contacts = function()
     nav.list(list)
     local bind_click = nav.scroll_aware(list)
 
-    -- dest_hex -> { row = <Button>, entry = <announce entry table> }
+    -- dest_hex -> { row = <Button>, entry = <roster entry table (see merge_roster)> }
     local contact_rows = {}
 
+    -- Unread indicator = union of the entry's store-side unread (ConvRow,
+    -- survives reboot) and the app's in-session unread[] table (live
+    -- messages seen while some OTHER screen/thread was open).
     local function fill_row(row, entry)
         row:clean()
         local label = resolve_name(entry.dest, entry.name)
-        local dot = unread[entry.dest] and "* " or ""
+        local is_unread = unread[entry.dest] or entry.unread
+        local dot = is_unread and "* " or ""
         local left = row:Label { text = dot .. label, align = lvgl.ALIGN.LEFT_MID }
-        if unread[entry.dest] then left:set { text_color = COL_ACCENT } end
+        if is_unread then left:set { text_color = COL_ACCENT } end
         local seen = (entry.last_seen and entry.last_seen > 0) and utils.relTime(entry.last_seen) or ""
         row:Label { text = seen, align = lvgl.ALIGN.RIGHT_MID, text_color = COL_META }
     end
 
-    -- Create-or-update a row for one announce entry. rns.lua updates entries
-    -- IN PLACE and never reorders __announces, so an existing row just gets
-    -- refilled — no index bookkeeping needed.
+    -- Create-or-update a row for one roster entry (conversation or announce
+    -- shape — both carry .dest/.name/.last_seen, see merge_roster).
     local function touch_row(entry)
         local e = contact_rows[entry.dest]
         if e then
@@ -178,21 +222,44 @@ show_contacts = function()
         end)
     end
 
-    local announces = rns:announces()
-    for _, entry in ipairs(announces) do touch_row(entry) end
-    if #announces == 0 then
+    local order, by_dest = merge_roster()
+    for _, dest in ipairs(order) do touch_row(by_dest[dest]) end
+    if #order == 0 then
         list:Label {
             text = "No announces yet. Waiting for peers...",
             w = lvgl.PCT(100), h = 40, text_color = COL_META,
         }
     end
 
-    -- Live updates while this screen is showing.
-    rns:onAnnounce(touch_row)
+    -- Live announce: a peer already backed by a conversation row keeps its
+    -- conv-derived fields (unread/is_conv) — the announce only backfills
+    -- last_seen/name the same way merge_roster does. A brand-new peer gets
+    -- a fresh (non-conv) row, same as before this change.
+    rns:onAnnounce(function(a)
+        local cur = contact_rows[a.dest]
+        if cur then
+            local e = cur.entry
+            if (not e.last_seen or e.last_seen == 0) and a.last_seen and a.last_seen > 0 then
+                e.last_seen = a.last_seen
+            end
+            if (not e.name or e.name == "") and a.name and a.name ~= "" then
+                e.name = a.name
+            end
+            fill_row(cur.row, e)
+        else
+            touch_row({ dest = a.dest, name = a.name, last_seen = a.last_seen, unread = false, is_conv = false })
+        end
+    end)
     rns:onMessage(function(msg)
         unread[msg.from] = true
         local e = contact_rows[msg.from]
-        if e then fill_row(e.row, e.entry) end
+        if e then
+            fill_row(e.row, e.entry)
+        else
+            -- Unannounced sender's first message this session (requirement 2
+            -- also holds live, not just post-reboot).
+            touch_row({ dest = msg.from, name = "", last_seen = msg.timestamp, unread = true, is_conv = true })
+        end
     end)
     rns:onDelivered(nil)   -- only meaningful inside an open thread
 end
@@ -255,16 +322,30 @@ show_thread = function(dest_hex, display_name)
         return bubble
     end
 
-    local history = rns:messages(dest_hex)   -- oldest first, cap 50 (rns.lua)
+    -- Seed from the persisted store (survives reboot — requirement 1), NOT
+    -- from rns:messages(dest_hex): that in-memory window already holds any
+    -- traffic dispatched live since boot, and would double-render anything
+    -- readThread also returns. Small window (<=16): each row is a file read
+    -- on the svc task inside run_cmd's 3500ms budget (P3_HANDOFF.md §4).
+    -- Everything AFTER this point comes only from the onMessage live-append
+    -- below, so seed and live window never overlap.
+    local _, hist_rows = rns:readThread(dest_hex, 16)
     local last_bubble
-    for _, msg in ipairs(history) do last_bubble = render_msg(msg) end
+    for _, r in ipairs(hist_rows) do
+        last_bubble = render_msg {
+            dir = r.incoming and "in" or "out",   -- native pushes a Lua boolean (rns_bridge.cpp lua_rns_read_thread)
+            text = r.text,
+            timestamp = r.ts,
+        }
+    end
     if last_bubble then last_bubble:scroll_to_view(false) end
-    if #history == 0 then
+    if #hist_rows == 0 then
         msg_list:Label {
             text = "No messages yet -- say hello.",
             text_color = COL_META, w = lvgl.PCT(100),
         }
     end
+    rns:markRead(dest_hex)
 
     -- Live updates while this thread is open.
     rns:onMessage(function(msg)

@@ -3,6 +3,8 @@ local clock_fmt = require("lib/clock_fmt")
 local messages = require("lib/mesh/messages")
 local nav = require("lib/nav")
 local utils = require("lib/utils")
+local wifi = require("lib/wifi")
+local rns = require("lib/rns")
 
 local M = {}
 
@@ -16,13 +18,12 @@ local function topbar_bg_opa()
 end
 
 local function format_epoch(ts, fmt)
-    if not ts or ts < 1 then return "--:--:--" end
+    if not ts or ts < 1 then return "--:--" end
     local SECS_PER_DAY = 86400
     local days = math.floor(ts / SECS_PER_DAY)
     local rem = ts - days * SECS_PER_DAY
     local hour = math.floor(rem / 3600)
     local min = math.floor((rem % 3600) / 60)
-    local sec = rem % 60
 
     days = days + 719468
     local era = math.floor(days / 146097)
@@ -39,9 +40,9 @@ local function format_epoch(ts, fmt)
         local ampm = (hour < 12) and "AM" or "PM"
         local h12 = hour % 12
         if h12 == 0 then h12 = 12 end
-        return string.format("%02d:%02d:%02d %s", h12, min, sec, ampm)
+        return string.format("%02d:%02d %s", h12, min, ampm)
     else
-        return string.format("%02d:%02d:%02d", hour, min, sec)
+        return string.format("%02d:%02d", hour, min)
     end
 end
 
@@ -78,6 +79,43 @@ local function render_battery_pct()
     return pct .. "%"
 end
 
+-- ── Network status indicators (WiFi glyph + RNS Auto/TCP dots) ──────────────
+-- A compact right-side cluster: the FontAwesome WiFi glyph, then colour-coded
+-- "A" (AutoInterface) and "T" (TCP client) letters. Colour is the whole signal
+-- so the labels never change width (the flex row stays put):
+--   green  = up / carrier live (wifi connected, auto running, tcp online)
+--   amber  = enabled but not yet up (connecting / no carrier / not linked)
+--   grey   = off / disabled  (TCP is disabled by default per the RNS design)
+-- All reads are pcall-guarded C calls so this is safe before the service is up.
+local WIFI_GLYPH = "\xEF\x87\xAB"   -- LV_SYMBOL_WIFI (resolves via the montserrat_14 fallback)
+local NET_UP   = "#3bd16f"
+local NET_WARN = "#e0a94a"
+local NET_DOWN = "#5a5a5a"
+
+local function wifi_color()
+    local ok, st = pcall(wifi.status)
+    if not ok or type(st) ~= "table" then return NET_DOWN end
+    if st.status == "connected"  then return NET_UP   end
+    if st.status == "connecting" then return NET_WARN end
+    return NET_DOWN
+end
+
+local function auto_color()
+    local ok, a = pcall(function() return rns:getAuto() end)
+    if not ok or type(a) ~= "table" then return NET_DOWN end
+    if a.running then return NET_UP   end
+    if a.enabled then return NET_WARN end
+    return NET_DOWN
+end
+
+local function tcp_color()
+    local ok, t = pcall(function() return rns:getTcp() end)
+    if not ok or type(t) ~= "table" then return NET_DOWN end
+    if t.online  then return NET_UP   end
+    if t.enabled then return NET_WARN end
+    return NET_DOWN
+end
+
 local function render_time()
     local ok, ts = pcall(_rtc_time)
     local epoch = ok and ts or 0
@@ -91,6 +129,8 @@ local paused = false
 local updateTimer
 local sat_tick_max = 150
 local sat_tick = sat_tick_max - 15 --we want gps to update the first time after the gps has a fix
+local net_tick_max = 5             -- refresh WiFi/Auto/TCP colours every ~5s
+local net_tick = net_tick_max
 local unread = 0
 local unread_label
 local unseen = 0
@@ -263,13 +303,32 @@ function M.create()
     M.updateNotif()
     local sat_label = bar:Label{ text = render_sat_indicator(), h = 20 }
 
+    -- Network cluster: WiFi glyph + Auto/TCP letters, each colour-coded (see the
+    -- render_* helpers). A fixed-width flex sub-group so the three stay adjacent
+    -- and the row never reflows as colours change. Not CLICKABLE, so taps fall
+    -- through to the bar's notification pull-down.
+    local net_group = bar:Object{
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        w = 48, h = 20, bg_opa = 0, border_width = 0, pad_all = 0,
+    }
+    net_group:clear_flag(lvgl.FLAG.SCROLLABLE)
+    local wifi_label = net_group:Label{ text = WIFI_GLYPH, h = 20, text_color = wifi_color() }
+    local auto_label = net_group:Label{ text = " A",       h = 20, text_color = auto_color() }
+    local tcp_label  = net_group:Label{ text = " T",       h = 20, text_color = tcp_color() }
+    local function refresh_net()
+        wifi_label:set{ text_color = wifi_color() }
+        auto_label:set{ text_color = auto_color() }
+        tcp_label:set{ text_color = tcp_color() }
+    end
+
     -- The whole bar is the tap target for the notification drop-down (the
     -- 20px labels are too small to hit reliably; phone-like pull-down).
     bar:add_flag(lvgl.FLAG.CLICKABLE)
     nav.tap(bar, function() M.toggleNotifPanel() end)
-    
+
     --the time label changes legnth by a couple pixels as time changes so give it a width so it does not move the flex grid
-    local time_label = bar:Label{ text = render_time(), h = 20 , w = 100 } 
+    --(HH:MM, no seconds now, so a narrower fixed width than before)
+    local time_label = bar:Label{ text = render_time(), h = 20 , w = 62 }
 
     local battery_label =  bar:Label{ text = render_battery_pct(), h = 20 }
     
@@ -295,6 +354,11 @@ function M.create()
                 -- Bell badge every tick (one C int read): also catches room
                 -- msgs and future non-mesh posts with no event plumbing.
                 M.updateNotif()
+                net_tick = net_tick + 1
+                if net_tick >= net_tick_max then
+                    net_tick = 0
+                    refresh_net()
+                end
                 sat_tick = sat_tick + 1
                 if sat_tick >= sat_tick_max then
                     sat_tick = 0
@@ -311,6 +375,7 @@ function M.pause()
     paused = true
     if updateTimer then updateTimer:pause() end
     sat_tick = sat_tick_max --we want to gps info to update on unpause
+    net_tick = net_tick_max --and the WiFi/Auto/TCP colours refreshed on unpause too
 end
 
 -- Fully hide the bar with FLAG.HIDDEN so it never renders, regardless of what's

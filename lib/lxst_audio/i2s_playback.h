@@ -105,6 +105,14 @@ private:
     std::atomic<bool> playing_{false};
     std::atomic<bool> muted_{false};
     void* taskHandle_ = nullptr;
+    // HYBRID (D12 hardening): set by playbackTask() immediately before
+    // vTaskDelete(NULL); stop() joins on this instead of the wadamesh
+    // reference's blind vTaskDelay(50ms) — required here because the task's
+    // stack (see PLAYBACK_TASK_CORE/PyxisCall.cpp's lxst_playback_get_stack)
+    // is a single static BSS block REUSED across calls, so start() must not
+    // hand it to a new task until the previous one is fully past its last
+    // I2S touch.
+    std::atomic<bool> taskExited_{false};
 
     Codec2Wrapper* codec_ = nullptr;  // Shared, not owned
     PacketRingBuffer* pcmRing_ = nullptr;
@@ -130,5 +138,10 @@ private:
     static constexpr int PREBUFFER_FRAMES = 15;
     static constexpr int PLAYBACK_TASK_STACK = 8192;
     static constexpr int PLAYBACK_TASK_PRIORITY = 5;
-    static constexpr int PLAYBACK_TASK_CORE = 0;
+    // HYBRID (D12 override): upstream/wadamesh pin this task to core 0.
+    // HYBRID_PLAN D2 reserves core 0 for LVGL+Lua+drains — a prio-5 task
+    // there would starve the ring-screen UI. Core 1, prio 5 matches the
+    // capture task (D2); both are DMA-bound (block on i2s_read/i2s_write,
+    // yielding CPU) so they coexist. See HYBRID_PLAN.md D12 §1, E12a.
+    static constexpr int PLAYBACK_TASK_CORE = 1;
 };

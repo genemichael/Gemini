@@ -215,4 +215,38 @@ function M:setTcp(enabled, host, port)
     return ok and res or false
 end
 
+-- ── Persisted conversations (native store, src/rns_bridge.cpp) ─────────────
+-- Unlike M:messages()/M:announces() above (in-memory windows, live traffic
+-- only), these three read the native MessageStore directly — the source of
+-- truth for anything that arrived before this boot. Same pcall-guard shape
+-- as M:getTcp(): the service may not be up yet (or ever, off-device), and
+-- callers must get a safe empty result rather than a Lua error either way.
+
+-- Conversation rows, newest-activity-first (native caps at 32; max here is
+-- clamped again on the C side — see rns_bridge.cpp). Each row:
+-- {peer=hex, name=, last=text, ts=, unread=, count=}. Empty table pre-service.
+function M:conversations(max)
+    local ok, list = pcall(_rns_list_conversations, max)
+    if not ok or type(list) ~= "table" then return {} end
+    return list
+end
+
+-- One thread's last N messages, oldest-first: name, {rows}. Each row is
+-- {text=, ts=, incoming=, state=}. Keep max small (<=16) -- every row is a
+-- file read on the svc task inside run_cmd's window (P3_HANDOFF.md §4).
+-- Returns nil, {} on failure (bad peer, service down) so callers can always
+-- ipairs() the second value without a type check.
+function M:readThread(peer_hex, max)
+    local ok, name, rows = pcall(_rns_read_thread, peer_hex, max)
+    if not ok or name == nil or type(rows) ~= "table" then return nil, {} end
+    return name, rows
+end
+
+-- Clears the native unread counter for one conversation. Returns false
+-- (never errors) pre-service or on a bad peer.
+function M:markRead(peer_hex)
+    local ok, res = pcall(_rns_mark_read, peer_hex)
+    return ok and res or false
+end
+
 return M

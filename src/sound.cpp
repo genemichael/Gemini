@@ -9,6 +9,13 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include "meshpunk_sync.h"
+#include "tdeck-pins.h"   // TDECK_I2S_BCK/WS/DOUT — D12 kMixerCfg pin capture
+
+// D12: PyxisCall.cpp's [call] logging uses this same passthrough for
+// production visibility at CORE_DEBUG_LEVEL=0 (defined there as the
+// lxst_audio serial sink). sound.cpp's mixer-reinstall failure is exactly
+// the kind of silent-death class that doctrine exists for.
+extern "C" void pyxis_log(const char* msg);
 
 extern "C" {
 #include <lua.h>
@@ -105,6 +112,14 @@ static SemaphoreHandle_t s_sound_mutex = nullptr;
 // because that inner take uses timeout 0 and never blocks.
 static SemaphoreHandle_t s_audio_mutex = nullptr;
 static volatile bool     s_sound_suspended = false;  // I2S halted for native module
+// D12 parked-ack: sound_task sets this true at the top of its loop each
+// pass it observes s_sound_suspended, false otherwise. sound_suspend()
+// polls it (bounded) instead of a blind delay — see sound_suspend() below.
+static volatile bool     s_sound_parked = false;
+// D12 self-heal: set by sound_i2s0_restore_after_call() when the mixer
+// i2s_driver_install fails: sound_task's suspended-loop pass retries this
+// (throttled) rather than leaving notification/MP3 audio dead until reboot.
+static volatile bool     s_mixer_reinstall_pending = false;
 
 extern void sd_spi_release();   // sd_spi_take() is inline in meshpunk_sync.h
 
@@ -184,8 +199,19 @@ void sound_suspend() {
         s_audio->stopSong();
         xSemaphoreGive(s_audio_mutex);
     }
-    // Let the sound task observe the flag and leave any in-flight i2s_write.
-    vTaskDelay(pdMS_TO_TICKS(30));
+    // D12 hardening: wait for sound_task's parked-ack instead of a blind
+    // delay. The old fixed 30ms wait could return while play_staged()'s
+    // i2s_write (up to a 100ms timeout per slice) was still in flight —
+    // harmless for the ELF-module suspend case this originally served, but
+    // D12 repurposes this same suspend/resume pair to arbitrate I2S0 against
+    // a call's native-8k driver install, where uninstalling under a live
+    // writer is a real hazard. Bounded at ~300ms (same order as this file's
+    // other cross-task waits, e.g. es7210_stage's 500ms).
+    uint32_t t0 = millis();
+    while (!s_sound_parked && millis() - t0 < 300) vTaskDelay(pdMS_TO_TICKS(5));
+    if (!s_sound_parked) {
+        SLog.println("[sound] WARNING: sound_task did not park within 300ms of suspend");
+    }
     // Halt the I2S peripheral + DMA so its TX-EOF ISR stops firing while the
     // CPU that services audio is handed to the module.
     i2s_stop(I2S_NUM_0);
@@ -196,6 +222,84 @@ void sound_resume() {
     i2s_start(I2S_NUM_0);
     tone_sr_set = false;          // force sample-rate reprogram on next tone
     s_sound_suspended = false;
+}
+
+// ── I2S0 ownership handoff for call-duration native-8k playback (D12) ──────
+//
+// Canonical mixer I2S0 config, captured verbatim from the ESP32-audioI2S
+// Audio library's own install (lib/ESP32-audioI2S/src/Audio.cpp:176-206
+// constructor — including this repo's MESHPUNK dma_buf_count halving,
+// 16 -> 8 — plus setPinout's pin assignment at main.cpp:8302). Built via an
+// immediately-invoked lambda rather than a designated initializer so field
+// order can't silently diverge from esp-idf's i2s_config_t across IDF
+// versions.
+//
+// sample_rate is programmed to 44100 here even though the library's own
+// constructor starts the port at 16000: sound_resume() unconditionally
+// forces tone_sr_set=false, so sound_task reprograms 44100 via
+// i2s_set_sample_rates() on its very next pass regardless (sound.cpp,
+// mixer branch). This struct only has to be a config the driver installs
+// cleanly with — matching 44100 keeps it honest about the value actually
+// in effect the rest of the time.
+static const i2s_config_t kMixerCfg = []() {
+    i2s_config_t c = {};
+    c.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    c.sample_rate           = 44100;
+    c.bits_per_sample       = I2S_BITS_PER_SAMPLE_16BIT;
+    c.channel_format        = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    c.communication_format  = I2S_COMM_FORMAT_STAND_I2S;
+    c.intr_alloc_flags      = ESP_INTR_FLAG_LEVEL1;   // matches Audio.cpp:178
+    c.dma_buf_count         = 8;
+    c.dma_buf_len           = 512;
+    c.use_apll              = false;
+    c.tx_desc_auto_clear    = true;
+    c.fixed_mclk            = I2S_PIN_NO_CHANGE;
+    return c;
+}();
+
+static const i2s_pin_config_t kMixerPins = []() {
+    i2s_pin_config_t p = {};
+    p.mck_io_num   = I2S_PIN_NO_CHANGE;
+    p.bck_io_num   = TDECK_I2S_BCK;
+    p.ws_io_num    = TDECK_I2S_WS;
+    p.data_out_num = TDECK_I2S_DOUT;
+    p.data_in_num  = I2S_PIN_NO_CHANGE;
+    return p;
+}();
+
+bool sound_i2s0_acquire_for_call() {
+    sound_suspend();
+    esp_err_t err = i2s_driver_uninstall(I2S_NUM_0);
+    if (err != ESP_OK) {
+        // Non-fatal on its own (e.g. the port was already down for some
+        // reason) — the caller's own driver_install will fail loudly and
+        // propagate if I2S0 is actually unusable.
+        SLog.printf("[sound] I2S0 uninstall (call acquire) returned %d\n", (int)err);
+    }
+    return true;
+}
+
+bool sound_i2s0_restore_after_call() {
+    esp_err_t err = i2s_driver_install(I2S_NUM_0, &kMixerCfg, 0, NULL);
+    if (err != ESP_OK) {
+        // The 16KB reinstall is the one allocation in this whole swap that
+        // can fail, at the worst time (right after a call, when WiFi RX
+        // DMA churn is a live confound). Log loudly — ESP_LOGE alone is
+        // invisible at this build's CORE_DEBUG_LEVEL=0 — and arm the
+        // self-heal retry instead of leaving notification/MP3 audio dead
+        // until reboot.
+        char msg[80];
+        snprintf(msg, sizeof(msg), "[call] MIXER REINSTALL FAILED — notif audio down (err=%d)", (int)err);
+        pyxis_log(msg);
+        s_mixer_reinstall_pending = true;
+        return false;
+    }
+    i2s_pin_config_t pins = kMixerPins;
+    i2s_set_pin(I2S_NUM_0, &pins);
+    i2s_set_sample_rates(I2S_NUM_0, 44100);
+    s_mixer_reinstall_pending = false;
+    sound_resume();
+    return true;
 }
 
 // ── External audio ring buffer ────────────────────────────────────────────────
@@ -1038,11 +1142,32 @@ static void sound_task_body(void* param) {
     const int CHUNK = 256;
 
     for (;;) {
-        // Parked while a native module owns the device (I2S is stopped).
+        // Parked while a native module (an ELF, or — since D12 — a call's
+        // native-8k I2SPlayback) owns the device (I2S is stopped).
+        // s_sound_parked is the parked-ack sound_suspend() polls instead of
+        // a blind delay (see sound_suspend()).
         if (s_sound_suspended) {
+            s_sound_parked = true;
+            // D12 self-heal: sound_i2s0_restore_after_call() leaves the
+            // mixer uninstalled (and this task parked, since sound_resume()
+            // was never reached) if its reinstall failed. Retry here,
+            // throttled — the DMA transient that caused the failure (WiFi
+            // RX churn, most likely) is usually gone within a few seconds,
+            // and this keeps notification/MP3 audio from staying dead until
+            // reboot.
+            if (s_mixer_reinstall_pending) {
+                static uint32_t s_last_retry = 0;
+                uint32_t now = millis();
+                if (now - s_last_retry >= 2000) {
+                    s_last_retry = now;
+                    SLog.println("[sound] mixer reinstall retry (self-heal)");
+                    sound_i2s0_restore_after_call();
+                }
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        s_sound_parked = false;
 
         if (s_audio->isRunning()) {
             // File decode runs HERE on Core 1 — moved off Core 0's loop() so a

@@ -5,10 +5,15 @@
 // its LVGL UIManager — see FINDINGS.md §4); wire format and state
 // transitions ported 1:1 from ../pyxis/lib/tdeck_ui/UI/LXMF/
 // UIManager.{h,cpp} ("UIM:<line>" citations in the .cpp). Audio per
-// HYBRID_PLAN D4/D5: mic capture via lxst_audio's I2SCapture
-// (I2S_NUM_1 + ES7210, exclusive to calls), speaker via meshpunk's
-// mixer pull API (sound_extern_set_pull) — the boot-installed
-// I2S_NUM_0 driver is never touched.
+// HYBRID_PLAN D5 (mic) + D12 (speaker, superseding D4's mixer-pull
+// design): mic capture via lxst_audio's I2SCapture (I2S_NUM_1 +
+// ES7210, exclusive to calls); speaker via lxst_audio's I2SPlayback,
+// which takes exclusive ownership of I2S_NUM_0 for call duration only
+// — sound.cpp's sound_i2s0_acquire_for_call()/sound_i2s0_restore_after_call()
+// swap the boot-installed mixer driver out and back in around the call
+// (D4's mixer-pull path measurably garbled RX audio; D12 replaced it
+// with native 8kHz playback, no resample). Outside a call, or once a
+// call ends, I2S0 is byte-identical to stock (HYBRID_PLAN rule 6).
 #pragma once
 
 #include <Arduino.h>

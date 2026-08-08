@@ -2,8 +2,15 @@
 //
 // LXST call engine — see PyxisCall.h. State machine, wire format, and
 // timeouts ported 1:1 from pyxis UIManager.cpp ("UIM:<line>"); the
-// LVGL side effects become CALL_* events, and the audio output path is
-// meshpunk's mixer (HYBRID_PLAN D4) instead of pyxis's I2SPlayback.
+// LVGL side effects become CALL_* events. The audio output path is
+// pyxis's own I2SPlayback (lib/lxst_audio/i2s_playback.cpp, ported from
+// ../pyxis / ../wadamesh), which owns I2S_NUM_0 exclusively for call
+// duration only — HYBRID_PLAN D12 (superseding D4's mixer-pull design,
+// which measurably garbled RX audio). sound.cpp's
+// sound_i2s0_acquire_for_call()/sound_i2s0_restore_after_call() do the
+// swap-out/swap-in around the call; audio_stop_and_free() is the single
+// idempotent restore owner (D12 §3) and runs on every call-end path via
+// call_ended().
 //
 // Threading:
 //  - Everything RNS (link callbacks, packets, FSM, TX pump) runs on the
@@ -14,8 +21,9 @@
 //    callbacks (same reason pyxis queues them; UIM:1241-1244).
 //  - ES7210 register I/O executes on core 0 via the s_es_req flag
 //    drained by pyxis_call_core0_service() in loop() (HYBRID_PLAN D5).
-//  - The mixer pull callback runs on meshpunk's sound_task (core 1),
-//    reading a PSRAM PCM ring filled by the decoder on the svc task.
+//  - I2SPlayback runs its own task (core 1, prio 5 — D12 §1) that reads
+//    a PSRAM PCM ring filled by writeEncodedPacket() (decode) called
+//    from call_rx_audio_frame() on the svc task.
 //  - Control API marshals through a pending-op flag consumed by
 //    pyxis_call_update() (mirrors pyxis's _call_answer_pending).
 
@@ -24,6 +32,8 @@
 
 #include <Wire.h>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>   // StackType_t — D12 static playback-task stack
 
 #include <microReticulum/Identity.h>
 #include <microReticulum/Destination.h>
@@ -33,15 +43,19 @@
 #include <LXMF/LXMRouter.h>
 
 #include "i2s_capture.h"
+#include "i2s_playback.h"
 #include "codec_wrapper.h"
 #include "es7210.h"
 #include "audio_hal.h"
 #include <driver/i2s.h>   // i2s_start/i2s_stop on the pre-installed mic port
 
-// meshpunk mixer pull API — C++ linkage matching src/sound.h's
-// declaration (declared here rather than including src/ headers into
-// the lib; the signature is part of the launcher's stable surface).
-void sound_extern_set_pull(void (*cb)(int16_t* out, int count), int sample_rate);
+// meshpunk I2S0 API — C++ linkage matching src/sound.h's declarations
+// (declared here rather than including src/ headers into the lib; the
+// signatures are part of the launcher's stable surface). D12: swap
+// I2S_NUM_0 from the mixer to the call's native-8k driver and back.
+// sound.cpp owns the canonical mixer config; see src/sound.h.
+bool sound_i2s0_acquire_for_call();
+bool sound_i2s0_restore_after_call();
 
 // lxst_audio's capture loop logs through pyxis's UDP logger; pyxis
 // defined it in main.cpp (pyxis:195). We don't port UDP logging —
@@ -147,57 +161,29 @@ static I2SCapture*    s_capture = nullptr;
 static Codec2Wrapper* s_enc = nullptr;
 static Codec2Wrapper* s_dec = nullptr;
 
-// Decoded-PCM ring (8kHz mono) feeding the mixer pull callback.
-// 16384 samples ≈ 2s; PSRAM so it never fights internal SRAM.
-static constexpr int PCM_RING = 16384;
-static int16_t* s_pcm_ring = nullptr;
-static volatile int s_pcm_w = 0, s_pcm_r = 0;
-static volatile bool s_playing = false;      // prebuffer passed, feeding mixer
-static int s_prebuffer_samples = 4800;       // ~600ms @8k (≈ pyxis's 15 frames)
-static uint32_t s_underruns = 0;
-static float s_resample_phase = 0.0f;
-static int16_t s_last_sample = 0;
+// D12: I2SPlayback owns its own decode (shared s_dec via configureDecoder)
+// + PCM ring (PSRAM) + prebuffer + native 8kHz I2S0 task. It replaces the
+// mixer-pull ring/resample block that used to live here (retired: no
+// resample, no mixer contact during a call). The object is persistent
+// (created once, boot time) like s_capture; only its per-call PSRAM
+// buffers come and go with configureDecoder()/releaseBuffers().
+static I2SPlayback* s_playback = nullptr;
 
-static inline int pcm_buffered() {
-    int w = s_pcm_w, r = s_pcm_r;
-    return (w - r + PCM_RING) % PCM_RING;
-}
+// D12 §3 idempotent-restore guard: true only after a successful I2S0
+// swap-in (sound_i2s0_acquire_for_call() ran), cleared only after a
+// successful swap-out (sound_i2s0_restore_after_call() returned true).
+// audio_stop_and_free() — the single restore owner, called unconditionally
+// from call_ended() on every end path — checks this so restoring is a
+// no-op when audio_start() failed before ever reaching the swap.
+static bool s_i2s0_owned_by_call = false;
 
-// Mixer pull callback — runs on sound_task (core 1). The mixer is told
-// we produce 11025Hz (its integer-upsample ceiling, ×4 → 44.1k); we
-// linearly resample our 8kHz ring by 8000/11025 per output sample.
-static void mixer_pull_cb(int16_t* out, int count) {
-    constexpr float STEP = 8000.0f / 11025.0f;
-    for (int i = 0; i < count; i++) {
-        // Re-arm on drain (PROFILE_AUDIT.md §4d; Columba garble,
-        // TESTLOG Live-bench 2026-08-07 underrun=27807/~40s): when the
-        // ring starves mid-playback, drop back behind the prebuffer
-        // gate instead of zero-stuffing per sample — the decoder path
-        // re-sets s_playing once s_prebuffer_samples refill, so jitter
-        // gaps become brief pauses rather than per-sample chatter.
-        // NOTE: s_underruns now counts drain EVENTS (one per re-arm),
-        // no longer starved output samples.
-        if (s_playing && pcm_buffered() < 2) {
-            s_playing = false;
-            s_underruns++;
-        }
-        if (!s_playing) {
-            out[i] = 0;
-            continue;
-        }
-        int r = s_pcm_r;
-        int16_t a = s_pcm_ring[r];
-        int16_t b = s_pcm_ring[(r + 1) % PCM_RING];
-        float t = s_resample_phase;
-        out[i] = (int16_t)(a + (b - a) * t);
-        s_resample_phase += STEP;
-        if (s_resample_phase >= 1.0f) {
-            s_resample_phase -= 1.0f;
-            s_pcm_r = (r + 1) % PCM_RING;
-            s_last_sample = a;
-        }
-    }
-}
+// D12 §4 / D11 doctrine: I2SPlayback's task stack is boot-reserved static
+// BSS (mirrors i2s_capture.cpp's s_cap_stack) — no call-time internal-heap
+// allocation. Exposed to i2s_playback.cpp (which cannot see this lib's
+// statics) through lxst_playback_get_stack(), matching wadamesh's
+// lxst_capture_set_stack() accessor pattern.
+static StackType_t s_play_stack[8192 / sizeof(StackType_t)];
+extern "C" void* lxst_playback_get_stack() { return s_play_stack; }
 
 // ES7210 bring-up marshalled to core 0 (D5). Stages: 1 = full init
 // (pre-clock), 2 = ctrl_state restart (post-clock). UIM has these
@@ -292,10 +278,11 @@ static void diag_mark(const char* what) {
 // failure leaves s_capture null and calls will refuse cleanly.
 static void audio_preallocate() {
     log_int_heap("prealloc in");
-    if (!s_pcm_ring) {
-        s_pcm_ring = (int16_t*)heap_caps_malloc(PCM_RING * sizeof(int16_t),
-                                                MALLOC_CAP_SPIRAM);
-    }
+    // D12: the object itself is a handful of pointer-sized members — its
+    // real PSRAM cost (decode buffer + PCM ring) is claimed later, per
+    // call, by configureDecoder(). The task stack it needs is the
+    // s_play_stack BSS array above, already reserved at link time.
+    if (!s_playback) s_playback = new I2SPlayback();
     s_capture = new I2SCapture();
     s_capture->setPersistent(true);
     if (!s_capture->init()) {
@@ -309,28 +296,43 @@ static void audio_preallocate() {
     Serial.println("[call] audio pipeline pre-allocated (persistent I2S)");
 }
 
+// D12 §3: the SINGLE idempotent restore owner. Called unconditionally from
+// call_ended() — the sole funnel every end path passes through (remote
+// hangup/link death, local hangup, BUSY/REJECTED, answer-time audio_start()
+// failure, timeouts, ACTIVE-link CLOSED). s_i2s0_owned_by_call makes the
+// restore a safe no-op when audio_start() never reached the swap (e.g.
+// codec2 create failure) — see audio_start()'s early-return paths, none of
+// which touch I2S0 before the swap step at the very end.
 static void audio_stop_and_free() {
-    s_playing = false;
-    sound_extern_set_pull(nullptr, 0);
+    if (s_playback) {
+        s_playback->stop();            // releases I2S_NUM_0 (join'd, D12 §4)
+        log_int_heap("i2s0 8k down");  // DMA budget measuring point (D12 §2)
+        s_playback->releaseBuffers();  // per-call PSRAM buffers
+    }
+    if (s_i2s0_owned_by_call) {
+        // Reinstall the mixer's byte-identical boot config. On failure the
+        // mixer stays down and sound.cpp's self-heal retry (its sound_task
+        // idle pass) keeps trying — leave the guard true so a later
+        // (redundant, idempotent) call_ended() pass doesn't skip this.
+        if (sound_i2s0_restore_after_call()) s_i2s0_owned_by_call = false;
+        log_int_heap("i2s0 mixer up");  // DMA budget measuring point (D12 §2)
+    }
     if (s_capture) {
         s_capture->stop();            // persistent: task + clocks only
         s_capture->releaseBuffers();  // per-call PSRAM buffers
     }
     if (s_enc) { s_enc->destroy(); delete s_enc; s_enc = nullptr; }
+    // s_playback->releaseBuffers() above already dropped its (unowned)
+    // pointer to s_dec, so it's safe to destroy s_dec here.
     if (s_dec) { s_dec->destroy(); delete s_dec; s_dec = nullptr; }
-    s_pcm_w = s_pcm_r = 0;
-    s_resample_phase = 0.0f;
 }
 
 static bool audio_start(int codec_mode) {
     log_int_heap("start");
-    if (!s_capture || !s_pcm_ring) {
+    if (!s_capture || !s_playback) {
         Serial.println("[call] audio not pre-allocated, cannot start");
         return false;
     }
-    s_pcm_w = s_pcm_r = 0;
-    s_playing = false;
-    s_underruns = 0;
 
     // ES7210 pre-clock init (core 0) → I2S clocks on → ES7210 restart
     // with clocks live. Sequence per lxst_audio.cpp; the driver is
@@ -354,6 +356,12 @@ static bool audio_start(int codec_mode) {
         return false;
     }
     log_int_heap("codec2 dec");
+    if (!s_playback->configureDecoder(s_dec)) {   // D12: shared codec, not owned
+        Serial.println("[call] playback decoder config FAILED");
+        audio_stop_and_free();
+        return false;
+    }
+    log_int_heap("playback decoder cfg");
     if (!s_capture->configureEncoder(s_enc, true)) {
         audio_stop_and_free();
         return false;
@@ -369,10 +377,26 @@ static bool audio_start(int codec_mode) {
         audio_stop_and_free();
         return false;
     }
-    // Speaker side: hand the mixer our pull callback (D4). Prebuffer
-    // gates actual playback inside the callback.
-    sound_extern_set_pull(mixer_pull_cb, 11025);
-    Serial.println("[call] audio pipeline up (capture + mixer pull)");
+
+    // Speaker side (D12): swap I2S_NUM_0 from the mixer to native-8k
+    // playback, call duration only. audio_stop_and_free() — call_ended()'s
+    // unconditional funnel — restores the mixer's byte-identical boot
+    // config at every end path, so this is safe even on a later abnormal
+    // exit (link death, timeout, etc.).
+    sound_i2s0_acquire_for_call();
+    // The mixer is uninstalled the instant acquire() returns, regardless of
+    // whether the 8k install below succeeds — so the ownership flag (and
+    // therefore the teardown restore obligation) is set here, not gated on
+    // s_playback->start()'s success.
+    s_i2s0_owned_by_call = true;
+    log_int_heap("i2s0 uninstall");   // DMA budget measuring point (D12 §2)
+    if (!s_playback->start()) {
+        Serial.println("[call] I2S0 native-8k playback start FAILED");
+        audio_stop_and_free();
+        return false;
+    }
+    log_int_heap("i2s0 8k up");       // DMA budget measuring point (D12 §2)
+    Serial.println("[call] audio pipeline up (capture + native-8k I2S0 playback)");
     return true;
 }
 
@@ -417,16 +441,24 @@ static void call_send_audio_batch(const uint8_t* batch, int batch_len) {  // UIM
 static void call_rx_audio_frame(const uint8_t* frame, size_t frame_len) {  // UIM:1206
     if (!s_dec || s_state == CallState::IDLE) return;
     if (frame[0] != LXST_CODEC_CODEC2) return;
-    static int16_t pcm[2048];
-    int n = s_dec->decode(frame + 1, (int)frame_len - 1, pcm, 2048);
-    if (n <= 0) return;
-    for (int i = 0; i < n; i++) {
-        int next = (s_pcm_w + 1) % PCM_RING;
-        if (next == s_pcm_r) break;   // full — drop newest
-        s_pcm_ring[s_pcm_w] = pcm[i];
-        s_pcm_w = next;
+    // D12: I2SPlayback decodes internally (shared s_dec via
+    // configureDecoder) and handles ring/prebuffer/underrun itself — no
+    // resample, no mixer. Strip the LXST codec byte; writeEncodedPacket
+    // wants the raw codec2 payload (i2s_playback.cpp feeds codec_->decode
+    // directly).
+    if (frame_len < 2 || !s_playback) return;
+    // Backlog cap, ported from ../wadamesh/lib/pyxis_core/PyxisCall.cpp
+    // (GPL-3.0, same license as this file): past ~500ms of buffered audio,
+    // DROP instead of decode. Decoding runs synchronously on the svc task
+    // in the RNS receive path, so an unbounded backlog is simultaneously
+    // (a) the audible latency and (b) a multi-second CPU burst that can
+    // starve the task WDT on a hangup flush. 25 frames ≈ 500ms @3200
+    // (20ms frames).
+    if (s_playback->bufferedFrames() > 25) {
+        s_rx_count++;   // count it as received; it is just not queued
+        return;
     }
-    if (!s_playing && pcm_buffered() >= s_prebuffer_samples) s_playing = true;
+    s_playback->writeEncodedPacket(frame + 1, (int)frame_len - 1);
     s_rx_count++;
 }
 
@@ -451,11 +483,17 @@ static void call_on_packet(const Bytes& data) {            // UIM:1241
             // call, flooding the 8-deep signal queue — answer signals
             // drowned, caller stuck at RINGING while the callee went
             // ACTIVE (TESTLOG Live-bench 2026-08-07). Adopt LBW/3200
-            // only (never 40ms modes — pcm[2048] scratch + WDT, §4);
-            // reply AT MOST ONCE per call with the EFFECTIVE profile,
-            // so even against an unpatched echo-always peer every
-            // exchange is bounded (it replies to our single ack; we
-            // never reply again).
+            // only (never 40ms modes — WDT, §4); reply AT MOST ONCE per
+            // call with the EFFECTIVE profile, so even against an
+            // unpatched echo-always peer every exchange is bounded (it
+            // replies to our single ack; we never reply again).
+            // D12 KEEP: this clamp also keeps I2SPlayback::configureDecoder's
+            // decodeBufSize_ = frameSamples_*16 safe (2560 samples for
+            // 3200's 160-sample/20ms frames — a 10-sub-frame batch decodes
+            // to 1600, comfortably under). 700C's 320-sample/40ms frames
+            // would need decodeBufSize_ > 2560 for the same batch depth
+            // (PROFILE_AUDIT.md §4a) — if this clamp is ever loosened to
+            // admit 700C, i2s_playback.cpp's *16 multiplier must grow too.
             int remote = signal - LXST_PREFERRED_PROFILE;
             if (remote == LXST_PROFILE_LBW) s_remote_profile = remote;
             if (!s_profile_acked) {
@@ -891,9 +929,13 @@ void pyxis_call_stats(uint32_t* tx, uint32_t* rx, int* play_buffered,
                       int* cap_avail, uint32_t* underruns) {
     if (tx) *tx = s_tx_count;
     if (rx) *rx = s_rx_count;
-    if (play_buffered) *play_buffered = pcm_buffered();
+    if (play_buffered) *play_buffered = s_playback ? s_playback->bufferedFrames() : 0;
     if (cap_avail) *cap_avail = s_capture ? s_capture->availablePackets() : -1;
-    if (underruns) *underruns = s_underruns;
+    // D12: no mixer underrun counter on the native-8k path (there is no
+    // mixer during a call). Codec2 decode failures are the wire-level
+    // fidelity signal instead — matches wadamesh's I2SPlayback-path
+    // mapping for this same stat.
+    if (underruns) *underruns = s_playback ? s_playback->decodeFailCount() : 0;
 }
 
 bool pyxis_call_set_profile(int profile) {
